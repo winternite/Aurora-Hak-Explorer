@@ -327,13 +327,10 @@ impl HakEditor {
                         human_size(MAX_IMAGE_FILE_SIZE)
                     ));
                 }
-                let format = image_format_for(&extension)
-                    .ok_or_else(|| format!("Unsupported image format: {extension}"))?;
                 let bytes = entry
                     .read_prefix(size)
                     .map_err(|error| format!("Could not read image: {error}"))?;
-                let decoded = image::load_from_memory_with_format(&bytes, format)
-                    .map_err(|error| format!("Could not decode image: {error}"))?;
+                let decoded = decode_preview_image(&bytes, &extension)?;
                 let width = decoded.width() as usize;
                 let height = decoded.height() as usize;
                 let decoded =
@@ -2301,6 +2298,84 @@ fn image_format_for(extension: &str) -> Option<image::ImageFormat> {
     })
 }
 
+fn decode_preview_image(bytes: &[u8], extension: &str) -> Result<image::DynamicImage, String> {
+    let format = image_format_for(extension)
+        .ok_or_else(|| format!("Unsupported image format: {extension}"))?;
+
+    if format == image::ImageFormat::Dds && !bytes.starts_with(b"DDS ") {
+        let standard_dds = nwn_dds_to_standard(bytes)?;
+        return image::load_from_memory_with_format(&standard_dds, image::ImageFormat::Dds)
+            .map_err(|error| format!("Could not decode NWN DDS image: {error}"));
+    }
+
+    image::load_from_memory_with_format(bytes, format)
+        .or_else(|format_error| {
+            // Some archives contain a resource whose type does not match its actual image
+            // encoding. Signature detection gives those resources a useful second chance.
+            image::load_from_memory(bytes).map_err(|_| format_error)
+        })
+        .map_err(|error| format!("Could not decode image: {error}"))
+}
+
+fn nwn_dds_to_standard(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    const NWN_HEADER_SIZE: usize = 20;
+    if bytes.len() < NWN_HEADER_SIZE {
+        return Err("NWN DDS header is truncated".into());
+    }
+
+    let read_u32 = |offset: usize| {
+        u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("four-byte field"),
+        )
+    };
+    let width = read_u32(0);
+    let height = read_u32(4);
+    let channels = read_u32(8);
+    let linear_size = read_u32(12);
+    if width == 0 || height == 0 {
+        return Err("NWN DDS has invalid dimensions".into());
+    }
+    let four_cc = match channels {
+        3 => *b"DXT1",
+        4 => *b"DXT5",
+        other => return Err(format!("Unsupported NWN DDS channel count: {other}")),
+    };
+    if bytes.len() - NWN_HEADER_SIZE < linear_size as usize {
+        return Err("NWN DDS pixel data is truncated".into());
+    }
+
+    let mut output = Vec::with_capacity(128 + bytes.len() - NWN_HEADER_SIZE);
+    output.extend_from_slice(b"DDS ");
+    let push_u32 = |output: &mut Vec<u8>, value: u32| {
+        output.extend_from_slice(&value.to_le_bytes());
+    };
+    push_u32(&mut output, 124); // DDS_HEADER size
+    push_u32(&mut output, 0x0008_1007); // caps, height, width, pixel format, linear size
+    push_u32(&mut output, height);
+    push_u32(&mut output, width);
+    push_u32(&mut output, linear_size);
+    push_u32(&mut output, 0); // depth
+    push_u32(&mut output, 0); // mip count; the preview only needs the top level
+    for _ in 0..11 {
+        push_u32(&mut output, 0);
+    }
+    push_u32(&mut output, 32); // DDS_PIXELFORMAT size
+    push_u32(&mut output, 0x4); // DDPF_FOURCC
+    output.extend_from_slice(&four_cc);
+    for _ in 0..5 {
+        push_u32(&mut output, 0);
+    }
+    push_u32(&mut output, 0x1000); // DDSCAPS_TEXTURE
+    for _ in 0..4 {
+        push_u32(&mut output, 0);
+    }
+    debug_assert_eq!(output.len(), 128);
+    output.extend_from_slice(&bytes[NWN_HEADER_SIZE..]);
+    Ok(output)
+}
+
 fn show_2da_preview(ui: &mut egui::Ui, bytes: &[u8]) {
     let text = String::from_utf8_lossy(bytes);
     let mut lines = text.lines().filter(|line| !line.trim().is_empty());
@@ -2386,5 +2461,22 @@ mod clipboard_tests {
         )
         .expect("the bundled PNG should decode through the preview path");
         assert_eq!((decoded.width(), decoded.height()), (256, 256));
+    }
+
+    #[test]
+    fn decodes_legacy_nwn_dds() {
+        let mut dds = Vec::new();
+        dds.extend_from_slice(&4_u32.to_le_bytes());
+        dds.extend_from_slice(&4_u32.to_le_bytes());
+        dds.extend_from_slice(&3_u32.to_le_bytes());
+        dds.extend_from_slice(&8_u32.to_le_bytes());
+        dds.extend_from_slice(&1.0_f32.to_le_bytes());
+        // One solid-red DXT1 block.
+        dds.extend_from_slice(&[0x00, 0xf8, 0x00, 0x00, 0, 0, 0, 0]);
+
+        let decoded = decode_preview_image(&dds, "dds").expect("NWN DDS should decode");
+        assert_eq!((decoded.width(), decoded.height()), (4, 4));
+        let pixel = decoded.into_rgba8().get_pixel(0, 0).0;
+        assert!(pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20);
     }
 }
