@@ -1547,7 +1547,7 @@ impl eframe::App for HakEditor {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Open HAK…").clicked() {
+                if ui.button("Open…").clicked() {
                     self.open_dialog();
                 }
                 if let Some((name, _, _, _, _)) = &archive_info {
@@ -1972,7 +1972,7 @@ impl eframe::App for HakEditor {
             egui::Window::new("About")
                 .open(&mut self.show_about)
                 .show(&ctx, |ui| {
-                    ui.heading("Aurora Hak Explorer (AHE) 0.2.1");
+                    ui.heading("Aurora Hak Explorer (AHE) 0.2.2");
                     ui.label("Native HAK/ERF archive management for Linux.");
                     ui.label("Copyright © 2026 Winternite");
                     ui.hyperlink_to(
