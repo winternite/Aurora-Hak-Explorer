@@ -143,6 +143,7 @@ struct HakEditor {
     cut_key_was_down: bool,
     paste_key_was_down: bool,
     compact_mode: bool,
+    dark_mode: bool,
     image_preview: Option<ImagePreviewCache>,
 }
 
@@ -257,11 +258,19 @@ impl TabState {
 
 impl HakEditor {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let compact_mode = cc
             .storage
             .and_then(|storage| eframe::get_value(storage, "compact_mode"))
             .unwrap_or(false);
+        let dark_mode = cc
+            .storage
+            .and_then(|storage| eframe::get_value(storage, "dark_mode"))
+            .unwrap_or(true);
+        cc.egui_ctx.set_visuals(if dark_mode {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
         Self {
             archive: None,
             selected: BTreeSet::new(),
@@ -297,6 +306,7 @@ impl HakEditor {
             cut_key_was_down: false,
             paste_key_was_down: false,
             compact_mode,
+            dark_mode,
             image_preview: None,
         }
     }
@@ -925,6 +935,7 @@ impl HakEditor {
 impl eframe::App for HakEditor {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "compact_mode", &self.compact_mode);
+        eframe::set_value(storage, "dark_mode", &self.dark_mode);
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
@@ -1160,6 +1171,22 @@ impl eframe::App for HakEditor {
                     }
                 });
                 ui.menu_button("View", |ui| {
+                    ui.label("Appearance");
+                    if ui
+                        .radio_value(&mut self.dark_mode, true, "Dark mode")
+                        .clicked()
+                    {
+                        ctx.set_visuals(egui::Visuals::dark());
+                        ui.close();
+                    }
+                    if ui
+                        .radio_value(&mut self.dark_mode, false, "Normal mode")
+                        .clicked()
+                    {
+                        ctx.set_visuals(egui::Visuals::light());
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui
                         .checkbox(&mut self.compact_mode, "Compact mode")
                         .on_hover_text(
