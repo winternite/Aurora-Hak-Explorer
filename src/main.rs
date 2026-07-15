@@ -367,6 +367,11 @@ impl HakEditor {
                         egui::Image::new(&image.texture).fit_to_exact_size(natural_size * scale),
                     );
                     ui.label(format!("{} × {} pixels", image.width, image.height));
+                    if extension.eq_ignore_ascii_case("plt") {
+                        ui.small(
+                            "Representative PLT layer colors; final colors are chosen in-game.",
+                        );
+                    }
                 });
             }
             Err(error) => {
@@ -1453,7 +1458,7 @@ impl eframe::App for HakEditor {
                         ui.group(|ui| {
                             ui.set_min_height(300.0);
                             let extension = entry.extension();
-                            if image_format_for(&extension).is_some() {
+                            if is_previewable_image(&extension) {
                                 self.show_image_preview(ui, entry);
                             } else {
                                 match entry.read_prefix(256 * 1024) {
@@ -1940,7 +1945,7 @@ impl eframe::App for HakEditor {
             egui::Window::new("About")
                 .open(&mut self.show_about)
                 .show(&ctx, |ui| {
-                    ui.heading("Aurora Hak Explorer (AHE) 0.2.1");
+                    ui.heading("Aurora Hak Explorer (AHE) 0.2.2");
                     ui.label("Native HAK/ERF archive management for Linux.");
                     ui.label("Copyright © 2026 Winternite");
                     ui.hyperlink_to(
@@ -2240,8 +2245,8 @@ fn category_for(extension: &str) -> &'static str {
     match extension {
         "2da" => "2DA",
         "nss" | "ncs" => "Scripts",
-        "mdl" | "mtr" | "plt" | "wok" | "pwk" | "dwk" => "Models",
-        "tga" | "dds" | "txi" | "bmp" | "jpg" | "png" | "ktx" => "Textures",
+        "mdl" | "mtr" | "wok" | "pwk" | "dwk" => "Models",
+        "tga" | "dds" | "plt" | "txi" | "bmp" | "jpg" | "png" | "ktx" => "Textures",
         "wav" | "mp3" | "ogg" | "bmu" => "Sounds",
         "are" | "git" | "gic" => "Areas",
         "utc" | "bic" => "Creatures",
@@ -2298,7 +2303,15 @@ fn image_format_for(extension: &str) -> Option<image::ImageFormat> {
     })
 }
 
+fn is_previewable_image(extension: &str) -> bool {
+    extension.eq_ignore_ascii_case("plt") || image_format_for(extension).is_some()
+}
+
 fn decode_preview_image(bytes: &[u8], extension: &str) -> Result<image::DynamicImage, String> {
+    if extension.eq_ignore_ascii_case("plt") {
+        return decode_plt_preview(bytes);
+    }
+
     let format = image_format_for(extension)
         .ok_or_else(|| format!("Unsupported image format: {extension}"))?;
 
@@ -2315,6 +2328,66 @@ fn decode_preview_image(bytes: &[u8], extension: &str) -> Result<image::DynamicI
             image::load_from_memory(bytes).map_err(|_| format_error)
         })
         .map_err(|error| format!("Could not decode image: {error}"))
+}
+
+fn decode_plt_preview(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    const HEADER_SIZE: usize = 24;
+    const LAYER_COLORS: [[u8; 4]; 10] = [
+        [224, 191, 160, 255], // skin
+        [74, 52, 26, 255],    // hair
+        [176, 184, 192, 255], // metal 1
+        [226, 168, 60, 255],  // metal 2
+        [171, 47, 39, 255],   // cloth 1
+        [42, 86, 173, 255],   // cloth 2
+        [92, 62, 41, 255],    // leather 1
+        [128, 92, 58, 255],   // leather 2
+        [37, 152, 117, 255],  // tattoo 1
+        [108, 64, 160, 255],  // tattoo 2
+    ];
+
+    if bytes.len() < HEADER_SIZE {
+        return Err("PLT header is truncated".into());
+    }
+    if &bytes[..8] != b"PLT V1  " {
+        return Err("Unsupported PLT signature or version".into());
+    }
+    let read_u32 = |offset: usize| {
+        u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("four-byte field"),
+        )
+    };
+    let width = read_u32(16);
+    let height = read_u32(20);
+    if width == 0 || height == 0 {
+        return Err("PLT has invalid dimensions".into());
+    }
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| "PLT dimensions are too large".to_owned())?;
+    let payload_size = pixel_count
+        .checked_mul(2)
+        .ok_or_else(|| "PLT payload is too large".to_owned())?;
+    if bytes.len() < HEADER_SIZE + payload_size {
+        return Err("PLT pixel data is truncated".into());
+    }
+
+    let mut rgba = Vec::with_capacity(pixel_count * 4);
+    for pixel in bytes[HEADER_SIZE..HEADER_SIZE + payload_size].chunks_exact(2) {
+        let value = u16::from(pixel[0]);
+        let base = LAYER_COLORS
+            .get(pixel[1] as usize)
+            .copied()
+            .unwrap_or([255, 0, 255, 255]);
+        for channel in base {
+            rgba.push(((u16::from(channel) * value + 127) / 255) as u8);
+        }
+    }
+
+    let buffer = image::RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| "Could not construct PLT preview image".to_owned())?;
+    Ok(image::DynamicImage::ImageRgba8(buffer))
 }
 
 fn nwn_dds_to_standard(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -2451,6 +2524,8 @@ mod clipboard_tests {
         assert_eq!(image_format_for("jpg"), Some(image::ImageFormat::Jpeg));
         assert_eq!(image_format_for("jpeg"), Some(image::ImageFormat::Jpeg));
         assert_eq!(image_format_for("mdl"), None);
+        assert!(is_previewable_image("plt"));
+        assert_eq!(category_for("plt"), "Textures");
     }
 
     #[test]
@@ -2478,5 +2553,19 @@ mod clipboard_tests {
         assert_eq!((decoded.width(), decoded.height()), (4, 4));
         let pixel = decoded.into_rgba8().get_pixel(0, 0).0;
         assert!(pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20);
+    }
+
+    #[test]
+    fn decodes_plt_with_representative_layer_colors() {
+        let mut plt = b"PLT V1  \x0a\0\0\0\0\0\0\0".to_vec();
+        plt.extend_from_slice(&2_u32.to_le_bytes());
+        plt.extend_from_slice(&1_u32.to_le_bytes());
+        plt.extend_from_slice(&[255, 4, 128, 5]);
+
+        let decoded = decode_preview_image(&plt, "plt").expect("PLT should decode");
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
+        let pixels = decoded.into_rgba8();
+        assert_eq!(pixels.get_pixel(0, 0).0, [171, 47, 39, 255]);
+        assert_eq!(pixels.get_pixel(1, 0).0, [21, 43, 87, 128]);
     }
 }

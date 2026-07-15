@@ -14,7 +14,7 @@ Aurora Hak Explorer (AHE) is a native, dark-themed, open-source archive editor f
 - Rewrite archives through a temporary file to avoid corrupting the original
 - Prompt to save or discard unsaved archives before closing tabs or quitting
 - Native dark interface with multiple archive tabs
-- Preview TGA, DDS, PNG, JPEG, BMP, GIF, TIFF, WebP, and other supported images in the Details pane
+- Preview TGA, DDS, PLT, PNG, JPEG, BMP, GIF, TIFF, WebP, and other supported images in the Details pane
 - Remembered compact mode that hides the resource tree and details panes
 - Search and type-to-select, sortable columns, multi-selection, drag files in or out, and keyboard shortcuts
 - Export one or several selected resources from the right-click menu
