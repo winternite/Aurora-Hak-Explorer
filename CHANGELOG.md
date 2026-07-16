@@ -20,7 +20,6 @@ All notable changes to Aurora Hak Explorer are recorded here.
 
 - Make Compact mode display every resource regardless of the previously selected tree category.
 - Add clearer right-click deletion for selected resources.
-- Set Winternite as the project author.
 
 ## 0.1.0 — 2026-07-15
 
