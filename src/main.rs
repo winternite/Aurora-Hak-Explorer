@@ -1470,13 +1470,18 @@ impl eframe::App for HakEditor {
                     ui.heading("Details");
                     ui.separator();
                     if let Some(entry) = &selected_entry {
+                        let entry_size = entry.size().unwrap_or(0);
                         ui.heading(entry.filename());
                         ui.horizontal_wrapped(|ui| {
                             ui.label(format!("Type: {}", entry.extension().to_ascii_uppercase()));
                             ui.separator();
                             ui.label(format!(
                                 "Size: {}",
-                                entry.size().map(human_size).unwrap_or_else(|_| "?".into())
+                                if entry_size == 0 {
+                                    "?".into()
+                                } else {
+                                    human_size(entry_size)
+                                }
                             ));
                             ui.separator();
                             ui.label(format!("Type ID: 0x{:04x}", entry.type_id));
@@ -1489,10 +1494,11 @@ impl eframe::App for HakEditor {
                                 self.show_image_preview(ui, entry);
                             } else {
                                 match entry.read_prefix(256 * 1024) {
-                                    Ok(bytes) if entry.extension() == "2da" => {
-                                        show_2da_preview(ui, &bytes)
+                                    Ok(bytes) if extension == "2da" => show_2da_preview(ui, &bytes),
+                                    Ok(bytes) if extension == "bmu" => {
+                                        show_bmu_preview(ui, &bytes, entry_size)
                                     }
-                                    Ok(bytes) if is_text_type(&entry.extension()) => {
+                                    Ok(bytes) if is_text_type(&extension) => {
                                         let text = String::from_utf8_lossy(&bytes);
                                         egui::ScrollArea::both().auto_shrink(false).show(
                                             ui,
@@ -1547,7 +1553,7 @@ impl eframe::App for HakEditor {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Open…").clicked() {
+                if ui.button("Open").clicked() {
                     self.open_dialog();
                 }
                 if let Some((name, _, _, _, _)) = &archive_info {
@@ -1972,7 +1978,7 @@ impl eframe::App for HakEditor {
             egui::Window::new("About")
                 .open(&mut self.show_about)
                 .show(&ctx, |ui| {
-                    ui.heading("Aurora Hak Explorer (AHE) 0.2.2");
+                    ui.heading("Aurora Hak Explorer (AHE) 0.2.3");
                     ui.label("Native HAK/ERF archive management for Linux.");
                     ui.label("Copyright © 2026 Winternite");
                     ui.hyperlink_to(
@@ -2301,6 +2307,7 @@ fn is_text_type(extension: &str) -> bool {
             | "nss"
             | "2da"
             | "txi"
+            | "mtr"
             | "ini"
             | "xml"
             | "gui"
@@ -2310,6 +2317,110 @@ fn is_text_type(extension: &str) -> bool {
             | "tml"
             | "sql"
     )
+}
+
+struct Mp3PreviewInfo {
+    version: &'static str,
+    bitrate_kbps: u32,
+    sample_rate_hz: u32,
+    channels: &'static str,
+    has_bmu_header: bool,
+}
+
+fn show_bmu_preview(ui: &mut egui::Ui, bytes: &[u8], total_size: u64) {
+    ui.vertical_centered(|ui| match parse_bmu_mp3_info(bytes) {
+        Ok(info) => {
+            ui.add_space(55.0);
+            ui.heading("BioWare music resource");
+            ui.label(if info.has_bmu_header {
+                "BMU V1.0-wrapped MP3 audio"
+            } else {
+                "Plain MP3 audio used as BMU"
+            });
+            ui.add_space(8.0);
+            egui::Grid::new("bmu_audio_info")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Encoding:");
+                    ui.label(info.version);
+                    ui.end_row();
+                    ui.label("Bitrate:");
+                    ui.label(format!("{} kbit/s", info.bitrate_kbps));
+                    ui.end_row();
+                    ui.label("Sample rate:");
+                    ui.label(format!("{} Hz", info.sample_rate_hz));
+                    ui.end_row();
+                    ui.label("Channels:");
+                    ui.label(info.channels);
+                    ui.end_row();
+                    if info.bitrate_kbps > 0 {
+                        let seconds =
+                            total_size.saturating_mul(8) / (u64::from(info.bitrate_kbps) * 1000);
+                        ui.label("Approx. duration:");
+                        ui.label(format!("{}:{:02}", seconds / 60, seconds % 60));
+                        ui.end_row();
+                    }
+                });
+        }
+        Err(error) => {
+            ui.add_space(80.0);
+            ui.heading("BioWare music resource");
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
+    });
+}
+
+fn parse_bmu_mp3_info(bytes: &[u8]) -> Result<Mp3PreviewInfo, String> {
+    let has_bmu_header = bytes.starts_with(b"BMU V1.0");
+    let start = if has_bmu_header { 8 } else { 0 };
+    let frame = bytes[start..]
+        .windows(4)
+        .find(|header| {
+            header[0] == 0xff
+                && header[1] & 0xe0 == 0xe0
+                && (header[1] >> 3) & 0x3 != 1
+                && (header[1] >> 1) & 0x3 != 0
+                && (header[2] >> 4) & 0xf != 0
+                && (header[2] >> 4) & 0xf != 0xf
+                && (header[2] >> 2) & 0x3 != 0x3
+        })
+        .ok_or_else(|| "No valid MP3 audio frame was found".to_owned())?;
+
+    let version_bits = (frame[1] >> 3) & 0x3;
+    let layer_bits = (frame[1] >> 1) & 0x3;
+    if layer_bits != 1 {
+        return Err("BMU audio is not MPEG Layer III".into());
+    }
+    let (version, bitrate_table, sample_rates): (&str, [u32; 15], [u32; 3]) = match version_bits {
+        3 => (
+            "MPEG-1 Layer III",
+            [
+                0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+            ],
+            [44_100, 48_000, 32_000],
+        ),
+        2 => (
+            "MPEG-2 Layer III",
+            [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+            [22_050, 24_000, 16_000],
+        ),
+        0 => (
+            "MPEG-2.5 Layer III",
+            [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+            [11_025, 12_000, 8_000],
+        ),
+        _ => return Err("Unsupported MPEG audio version".into()),
+    };
+    let bitrate_kbps = bitrate_table[(frame[2] >> 4) as usize];
+    let sample_rate_hz = sample_rates[((frame[2] >> 2) & 0x3) as usize];
+    let channels = if frame[3] >> 6 == 3 { "Mono" } else { "Stereo" };
+    Ok(Mp3PreviewInfo {
+        version,
+        bitrate_kbps,
+        sample_rate_hz,
+        channels,
+        has_bmu_header,
+    })
 }
 
 fn image_format_for(extension: &str) -> Option<image::ImageFormat> {
@@ -2660,6 +2771,7 @@ mod clipboard_tests {
         assert_eq!(image_format_for("mdl"), None);
         assert!(is_previewable_image("plt"));
         assert_eq!(category_for("plt"), "Textures");
+        assert!(is_text_type("mtr"));
     }
 
     #[test]
@@ -2719,5 +2831,17 @@ mod clipboard_tests {
         let pixels = decoded.into_rgba8();
         assert_eq!(pixels.get_pixel(0, 0).0, [171, 47, 39, 255]);
         assert_eq!(pixels.get_pixel(1, 0).0, [21, 43, 87, 128]);
+    }
+
+    #[test]
+    fn recognizes_bmu_wrapped_mp3_audio() {
+        let mut bmu = b"BMU V1.0".to_vec();
+        bmu.extend_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
+        let info = parse_bmu_mp3_info(&bmu).expect("BMU MP3 frame should be recognized");
+        assert!(info.has_bmu_header);
+        assert_eq!(info.version, "MPEG-1 Layer III");
+        assert_eq!(info.bitrate_kbps, 128);
+        assert_eq!(info.sample_rate_hz, 44_100);
+        assert_eq!(info.channels, "Stereo");
     }
 }

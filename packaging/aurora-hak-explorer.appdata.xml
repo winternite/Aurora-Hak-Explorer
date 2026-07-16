@@ -9,5 +9,5 @@
   <launchable type="desktop-id">aurora-hak-explorer.desktop</launchable>
   <provides><binary>aurora-hak-explorer</binary></provides>
   <content_rating type="oars-1.1"/>
-  <releases><release version="0.2.2" date="2026-07-16"/></releases>
+  <releases><release version="0.2.3" date="2026-07-16"/></releases>
 </component>

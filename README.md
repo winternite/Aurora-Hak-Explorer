@@ -2,6 +2,8 @@
 
 Aurora Hak Explorer (AHE) is a native, dark-themed, open-source archive editor for Neverwinter Nights. It is intended as a modern Linux replacement for the classic `nwhak.exe` utility.
 
+See [CHANGELOG.md](CHANGELOG.md) for release history.
+
 ## Features
 
 - Open and validate ERF V1.0 and V1.1 containers
@@ -16,6 +18,7 @@ Aurora Hak Explorer (AHE) is a native, dark-themed, open-source archive editor f
 - Native dark interface with multiple archive tabs
 - Switch between remembered Dark and Normal appearance modes (Dark by default)
 - Preview TGA, DDS, PLT, PNG, JPEG, BMP, GIF, TIFF, WebP, and other supported images in the Details pane
+- Preview MTR material files as text and inspect BMU/MP3 audio properties in the Details pane
 - Remembered compact mode that hides the resource tree and details panes
 - Search and type-to-select, sortable columns, multi-selection, drag files in or out, and keyboard shortcuts
 - Export one or several selected resources from the right-click menu
