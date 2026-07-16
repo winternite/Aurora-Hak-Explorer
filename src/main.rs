@@ -2065,17 +2065,60 @@ impl eframe::App for HakEditor {
             self.show_description &= open;
         }
         if self.show_about {
-            egui::Window::new("About")
-                .open(&mut self.show_about)
+            let mut close = false;
+            let theme = if self.dark_mode {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            };
+            let modal = egui::Modal::new(egui::Id::new("about_modal"))
+                .frame(egui::Frame::popup(&ctx.style_of(theme)).inner_margin(26.0))
                 .show(&ctx, |ui| {
-                    ui.heading("Aurora Hak Explorer (AHE) 0.2.3");
-                    ui.label("Native HAK/ERF archive management for Linux.");
-                    ui.label("Copyright © 2026 Winternite");
-                    ui.hyperlink_to(
-                        "GNU GPL v3 or later",
-                        "https://www.gnu.org/licenses/gpl-3.0.html",
-                    );
+                    ui.set_min_width(480.0);
+                    ui.spacing_mut().item_spacing.y = 11.0;
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Aurora Hak Explorer (AHE) {}",
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .size(23.0)
+                            .strong(),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Explore and edit Neverwinter Nights resource archives.",
+                            )
+                            .size(17.0),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Create, inspect, import, extract, and safely rewrite HAK, ERF, MOD, and SAV files on Linux and Windows.",
+                            )
+                            .size(15.0)
+                            .weak(),
+                        );
+                        ui.add_space(5.0);
+                        ui.label("Copyright © 2026 Winternite");
+                        ui.hyperlink_to(
+                            "GNU GPL v3 or later",
+                            "https://www.gnu.org/licenses/gpl-3.0.html",
+                        );
+                        ui.add_space(7.0);
+                        if ui
+                            .add_sized(
+                                [120.0, 36.0],
+                                egui::Button::new(RichText::new("Close").size(16.0)),
+                            )
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    });
                 });
+            if modal.should_close() || close {
+                self.show_about = false;
+            }
         }
         let conflict_details = self.pending_add.as_ref().and_then(|batch| {
             batch.conflict.as_ref().map(|conflict| {
@@ -2193,7 +2236,7 @@ impl eframe::App for HakEditor {
                         .size(17.0),
                     );
                     ui.add_space(6.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_centered(|ui| {
                         if ui
                             .add_sized(
                                 [120.0, 38.0],
