@@ -1560,6 +1560,9 @@ impl eframe::App for HakEditor {
                 .flatten()
         });
         egui::Panel::top("document_tabs").show(ui, |ui| {
+            // Keep the horizontal scrollbar in its own row so it cannot cover
+            // the lower edge of the archive tabs when many tabs are open.
+            ui.spacing_mut().scroll.floating = false;
             egui::ScrollArea::horizontal()
                 .id_salt("open_archive_tabs")
                 .show(ui, |ui| {
