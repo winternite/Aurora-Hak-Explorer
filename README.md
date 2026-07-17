@@ -16,9 +16,11 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 - Rewrite archives through a temporary file to avoid corrupting the original
 - Prompt to save or discard unsaved archives before closing tabs or quitting
 - Native dark interface with multiple archive tabs
-- Switch between remembered Dark and Normal appearance modes (Dark by default)
+- Switch between remembered System, Dark, and Light appearance modes (Dark by default)
 - Preview TGA, DDS, PLT, PNG, JPEG, BMP, GIF, TIFF, WebP, and other supported images in the Details pane
 - Preview MTR material files as text and inspect BMU/MP3 audio properties in the Details pane
+- Inspect ASCII source for uncompiled MDL models and summaries or extracted strings for compiled models
+- Reopen archives quickly from the remembered recent-files list
 - Remembered compact mode that hides the resource tree and details panes
 - Search and type-to-select, sortable columns, multi-selection, drag files in or out, and keyboard shortcuts
 - Export one or several selected resources from the right-click menu

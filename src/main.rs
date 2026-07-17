@@ -21,6 +21,9 @@ const MAX_IMAGE_FILE_SIZE: u64 = 128 * 1024 * 1024;
 const MAX_IMAGE_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_IMAGE_SIDE: u32 = 16_384;
 const MAX_TEXTURE_SIDE: u32 = 4096;
+const MAX_RECENT_ARCHIVES: usize = 8;
+const MAX_MODEL_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_EXTRACTED_MODEL_STRINGS: usize = 2_000;
 
 fn main() -> eframe::Result {
     let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -149,8 +152,12 @@ struct HakEditor {
     cut_key_was_down: bool,
     paste_key_was_down: bool,
     compact_mode: bool,
-    dark_mode: bool,
+    appearance: Appearance,
+    recent_archives: Vec<PathBuf>,
+    resource_middle_scroll_active: bool,
     image_preview: Option<ImagePreviewCache>,
+    model_preview: Option<ModelPreviewCache>,
+    model_view: ModelView,
 }
 
 struct ImagePreviewCache {
@@ -164,11 +171,61 @@ struct CachedImage {
     height: usize,
 }
 
+struct ModelPreviewCache {
+    key: String,
+    result: Result<ModelPreview, String>,
+}
+
+enum ModelPreview {
+    Uncompiled {
+        text: String,
+        truncated: bool,
+    },
+    Compiled {
+        name: Option<String>,
+        structured_size: u64,
+        raw_size: u64,
+        strings: Vec<String>,
+        truncated: bool,
+    },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ModelView {
+    Summary,
+    Strings,
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SortColumn {
     Name,
     Type,
     Size,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Appearance {
+    System,
+    Dark,
+    Light,
+}
+
+impl Appearance {
+    fn preference(self) -> egui::ThemePreference {
+        match self {
+            Self::System => egui::ThemePreference::System,
+            Self::Dark => egui::ThemePreference::Dark,
+            Self::Light => egui::ThemePreference::Light,
+        }
+    }
+
+    fn storage_value(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -272,15 +329,34 @@ impl HakEditor {
             .storage
             .and_then(|storage| eframe::get_value(storage, "compact_mode"))
             .unwrap_or(false);
-        let dark_mode = cc
+        let legacy_dark_mode = cc
             .storage
             .and_then(|storage| eframe::get_value(storage, "dark_mode"))
             .unwrap_or(true);
-        cc.egui_ctx.set_visuals(if dark_mode {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        });
+        let appearance = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<String>(storage, "appearance"))
+            .and_then(|value| match value.as_str() {
+                "system" => Some(Appearance::System),
+                "dark" => Some(Appearance::Dark),
+                "light" => Some(Appearance::Light),
+                _ => None,
+            })
+            .unwrap_or(if legacy_dark_mode {
+                Appearance::Dark
+            } else {
+                Appearance::Light
+            });
+        let recent_archives = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<Vec<String>>(storage, "recent_archives"))
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|path| path.is_file() && is_archive_path(path))
+            .take(MAX_RECENT_ARCHIVES)
+            .collect();
+        cc.egui_ctx.set_theme(appearance.preference());
         Self {
             archive: None,
             selected: BTreeSet::new(),
@@ -316,8 +392,12 @@ impl HakEditor {
             cut_key_was_down: false,
             paste_key_was_down: false,
             compact_mode,
-            dark_mode,
+            appearance,
+            recent_archives,
+            resource_middle_scroll_active: false,
             image_preview: None,
+            model_preview: None,
+            model_view: ModelView::Summary,
         }
     }
 
@@ -396,6 +476,115 @@ impl HakEditor {
                     ui.add_space(90.0);
                     ui.colored_label(Color32::LIGHT_RED, error);
                 });
+            }
+        }
+    }
+
+    fn show_model_preview(&mut self, ui: &mut egui::Ui, entry: &archive::Entry) {
+        let size = entry.size().unwrap_or(0);
+        let key = format!(
+            "model-preview:{}:{}:{}:{}",
+            self.active_tab.unwrap_or(usize::MAX),
+            entry.filename(),
+            entry.type_id,
+            size
+        );
+        if self
+            .model_preview
+            .as_ref()
+            .is_none_or(|cache| cache.key != key)
+        {
+            let result = entry
+                .read_prefix(size.min(MAX_MODEL_PREVIEW_BYTES))
+                .map_err(|error| format!("Could not read model: {error}"))
+                .and_then(|bytes| decode_model_preview(&bytes, size));
+            self.model_preview = Some(ModelPreviewCache { key, result });
+            self.model_view = ModelView::Summary;
+        }
+
+        match &self.model_preview.as_ref().unwrap().result {
+            Ok(ModelPreview::Uncompiled { text, truncated }) => {
+                ui.label(RichText::new("Model Uncompiled").size(16.0).strong());
+                ui.label("ASCII model source");
+                if *truncated {
+                    ui.small(format!(
+                        "Preview limited to the first {}",
+                        human_size(MAX_MODEL_PREVIEW_BYTES)
+                    ));
+                }
+                ui.separator();
+                egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                    ui.add(egui::Label::new(RichText::new(text).monospace()).selectable(true));
+                });
+            }
+            Ok(ModelPreview::Compiled {
+                name,
+                structured_size,
+                raw_size,
+                strings,
+                truncated,
+            }) => {
+                ui.label(RichText::new("Model Compiled").size(16.0).strong());
+                ui.label("Aurora binary model");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.model_view, ModelView::Summary, "Summary");
+                    ui.selectable_value(
+                        &mut self.model_view,
+                        ModelView::Strings,
+                        "Extracted strings",
+                    );
+                });
+                ui.separator();
+                match self.model_view {
+                    ModelView::Summary => {
+                        egui::Grid::new("compiled_model_summary")
+                            .num_columns(2)
+                            .show(ui, |ui| {
+                                ui.label("Model name:");
+                                ui.label(name.as_deref().unwrap_or("Unavailable"));
+                                ui.end_row();
+                                ui.label("Structured data:");
+                                ui.label(human_size(*structured_size));
+                                ui.end_row();
+                                ui.label("Raw geometry data:");
+                                ui.label(human_size(*raw_size));
+                                ui.end_row();
+                                ui.label("Readable strings:");
+                                ui.label(strings.len().to_string());
+                                ui.end_row();
+                            });
+                        if *truncated {
+                            ui.add_space(8.0);
+                            ui.small(format!(
+                                "String extraction limited to the first {}",
+                                human_size(MAX_MODEL_PREVIEW_BYTES)
+                            ));
+                        }
+                    }
+                    ModelView::Strings => {
+                        ui.label(format!("{} readable strings", strings.len()));
+                        if *truncated {
+                            ui.small(format!(
+                                "Scanned the first {} of this model",
+                                human_size(MAX_MODEL_PREVIEW_BYTES)
+                            ));
+                        }
+                        egui::ScrollArea::vertical()
+                            .auto_shrink(false)
+                            .show(ui, |ui| {
+                                for string in strings {
+                                    ui.add(
+                                        egui::Label::new(RichText::new(string).monospace())
+                                            .selectable(true),
+                                    );
+                                }
+                            });
+                    }
+                }
+            }
+            Err(error) => {
+                ui.label(RichText::new("Model format unknown").size(16.0).strong());
+                ui.colored_label(Color32::LIGHT_RED, error);
             }
         }
     }
@@ -602,11 +791,13 @@ impl HakEditor {
         }
     }
     fn open_path(&mut self, path: PathBuf) {
+        let path = fs::canonicalize(&path).unwrap_or(path);
         if let Some(index) = self
             .tabs
             .iter()
             .position(|tab| tab.archive.path.as_deref() == Some(path.as_path()))
         {
+            self.remember_recent_archive(&path);
             self.switch_tab(index);
             return;
         }
@@ -617,16 +808,25 @@ impl HakEditor {
                 self.tabs.push(TabState::new(archive, false));
                 self.load_tab(self.tabs.len() - 1);
                 self.status = format!("Opened {} — {count} resources", path.display());
+                self.remember_recent_archive(&path);
             }
             Err(e) => self.fail("Could not open archive", e),
         }
     }
+    fn remember_recent_archive(&mut self, path: &std::path::Path) {
+        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.recent_archives.retain(|recent| recent != &path);
+        self.recent_archives.insert(0, path);
+        self.recent_archives.truncate(MAX_RECENT_ARCHIVES);
+    }
     fn open_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
+        if let Some(paths) = rfd::FileDialog::new()
             .add_filter("NWN archives", &["hak", "erf", "mod", "sav"])
-            .pick_file()
+            .pick_files()
         {
-            self.open_path(path);
+            for path in paths {
+                self.open_path(path);
+            }
         }
     }
     fn save(&mut self, save_as: bool) {
@@ -650,6 +850,7 @@ impl HakEditor {
                 // entries with archive slices. Update the tab once here
                 // instead of cloning the full archive every UI frame.
                 self.sync_current_tab();
+                self.remember_recent_archive(&path);
             }
             Err(e) => self.fail("Could not save archive", e),
         }
@@ -1037,6 +1238,13 @@ impl HakEditor {
         self.show_new = false;
         self.status = "Created a new unsaved archive".into();
     }
+    fn active_theme(&self, ctx: &egui::Context) -> egui::Theme {
+        match self.appearance {
+            Appearance::System => ctx.system_theme().unwrap_or(egui::Theme::Dark),
+            Appearance::Dark => egui::Theme::Dark,
+            Appearance::Light => egui::Theme::Light,
+        }
+    }
     fn title(&self) -> String {
         let name = self
             .archive
@@ -1056,7 +1264,13 @@ impl HakEditor {
 impl eframe::App for HakEditor {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "compact_mode", &self.compact_mode);
-        eframe::set_value(storage, "dark_mode", &self.dark_mode);
+        eframe::set_value(storage, "appearance", &self.appearance.storage_value());
+        let recent_archives = self
+            .recent_archives
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        eframe::set_value(storage, "recent_archives", &recent_archives);
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
@@ -1294,17 +1508,24 @@ impl eframe::App for HakEditor {
                 ui.menu_button("View", |ui| {
                     ui.label("Appearance");
                     if ui
-                        .radio_value(&mut self.dark_mode, true, "Dark mode")
+                        .radio_value(&mut self.appearance, Appearance::System, "System")
                         .clicked()
                     {
-                        ctx.set_visuals(egui::Visuals::dark());
+                        ctx.set_theme(self.appearance.preference());
                         ui.close();
                     }
                     if ui
-                        .radio_value(&mut self.dark_mode, false, "Normal mode")
+                        .radio_value(&mut self.appearance, Appearance::Dark, "Dark")
                         .clicked()
                     {
-                        ctx.set_visuals(egui::Visuals::light());
+                        ctx.set_theme(self.appearance.preference());
+                        ui.close();
+                    }
+                    if ui
+                        .radio_value(&mut self.appearance, Appearance::Light, "Light")
+                        .clicked()
+                    {
+                        ctx.set_theme(self.appearance.preference());
                         ui.close();
                     }
                     ui.separator();
@@ -1328,6 +1549,13 @@ impl eframe::App for HakEditor {
         });
         let mut requested_switch = None;
         let mut requested_close = None;
+        let middle_click = ctx.input(|input| {
+            input
+                .pointer
+                .button_clicked(egui::PointerButton::Middle)
+                .then(|| input.pointer.hover_pos())
+                .flatten()
+        });
         egui::Panel::top("document_tabs").show(ui, |ui| {
             egui::ScrollArea::horizontal()
                 .id_salt("open_archive_tabs")
@@ -1448,6 +1676,11 @@ impl eframe::App for HakEditor {
                                 requested_switch = Some(index);
                             }
                             if tab.inner.1.clicked() {
+                                requested_close = Some(index);
+                            }
+                            if middle_click
+                                .is_some_and(|position| tab.response.rect.contains(position))
+                            {
                                 requested_close = Some(index);
                             }
                             ui.add_space(2.0);
@@ -1710,11 +1943,16 @@ impl eframe::App for HakEditor {
                             let extension = entry.extension();
                             if is_previewable_image(&extension) {
                                 self.show_image_preview(ui, entry);
+                            } else if extension == "mdl" {
+                                self.show_model_preview(ui, entry);
                             } else {
                                 match entry.read_prefix(256 * 1024) {
                                     Ok(bytes) if extension == "2da" => show_2da_preview(ui, &bytes),
                                     Ok(bytes) if extension == "bmu" => {
                                         show_bmu_preview(ui, &bytes, entry_size)
+                                    }
+                                    Ok(bytes) if extension == "wav" => {
+                                        show_wav_resource_preview(ui, &bytes, entry_size)
                                     }
                                     Ok(bytes) if is_text_type(&extension) => {
                                         let text = String::from_utf8_lossy(&bytes);
@@ -1941,7 +2179,8 @@ impl eframe::App for HakEditor {
                 let mut request_delete = false;
                 let mut request_export = false;
                 let mut request_drag = None;
-                egui::ScrollArea::vertical()
+                let resource_scroll = egui::ScrollArea::vertical()
+                    .id_salt("resource_entries")
                     .auto_shrink(false)
                     .show(ui, |ui| {
                         egui::Grid::new("entries")
@@ -2056,7 +2295,7 @@ impl eframe::App for HakEditor {
                                         self.selection_anchor = Some(index);
                                         self.selection_cursor = Some(index);
                                     }
-                                    if response.drag_started() {
+                                    if response.drag_started_by(egui::PointerButton::Primary) {
                                         if !selected {
                                             self.selected.clear();
                                             self.selected.insert(index);
@@ -2094,6 +2333,33 @@ impl eframe::App for HakEditor {
                                 }
                             });
                     });
+                let (middle_pressed, middle_down, pointer_position, pointer_delta) =
+                    ctx.input(|input| {
+                        (
+                            input.pointer.button_pressed(egui::PointerButton::Middle),
+                            input.pointer.middle_down(),
+                            input.pointer.hover_pos(),
+                            input.pointer.delta(),
+                        )
+                    });
+                if middle_pressed
+                    && pointer_position
+                        .is_some_and(|position| resource_scroll.inner_rect.contains(position))
+                {
+                    self.resource_middle_scroll_active = true;
+                }
+                if self.resource_middle_scroll_active && middle_down {
+                    let mut state = resource_scroll.state;
+                    let maximum_offset = (resource_scroll.content_size.y
+                        - resource_scroll.inner_rect.height())
+                    .max(0.0);
+                    state.offset.y = (state.offset.y + pointer_delta.y).clamp(0.0, maximum_offset);
+                    state.store(&ctx, resource_scroll.id);
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    ctx.request_repaint();
+                } else if !middle_down {
+                    self.resource_middle_scroll_active = false;
+                }
                 if request_drag.is_some() {
                     self.drag_selected(frame);
                 } else if request_export {
@@ -2120,31 +2386,97 @@ impl eframe::App for HakEditor {
                     }
                 });
             } else {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.heading("Aurora Hak Explorer");
-                    ui.label("AHE");
-                    ui.label("A native editor for Neverwinter Nights HAK and ERF archives");
-                    ui.add_space(16.0);
-                    if ui.button("Open an archive").clicked() {
-                        self.open_dialog();
-                    }
-                    if ui.button("Create a new archive").clicked() {
-                        self.show_new = true;
-                    }
-                    ui.add_space(10.0);
-                    ui.label("You can also drop a .hak, .erf, .mod, or .sav file here.");
-                });
+                egui::ScrollArea::vertical()
+                    .id_salt("welcome_screen")
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(72.0);
+                            ui.heading("Aurora Hak Explorer");
+                            ui.label("AHE");
+                            ui.label("A native editor for Neverwinter Nights HAK and ERF archives");
+                            ui.add_space(16.0);
+                            if ui
+                                .add_sized(
+                                    [200.0, 34.0],
+                                    egui::Button::new(
+                                        RichText::new("+  Open an archive").size(14.0),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                self.open_dialog();
+                            }
+                            if ui
+                                .add_sized(
+                                    [200.0, 34.0],
+                                    egui::Button::new(
+                                        RichText::new("+  Create a new archive").size(14.0),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                self.show_new = true;
+                            }
+                            ui.add_space(10.0);
+                            ui.label("You can also drop a .hak, .erf, .mod, or .sav file here.");
+                            if !self.recent_archives.is_empty() {
+                                ui.add_space(24.0);
+                                ui.label(RichText::new("Recently opened").size(16.0).strong());
+                                ui.add_space(4.0);
+                                let mut requested_recent = None;
+                                for path in self.recent_archives.clone() {
+                                    let filename = path
+                                        .file_name()
+                                        .map(|name| name.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| path.display().to_string());
+                                    let directory = path
+                                        .parent()
+                                        .map(|parent| parent.display().to_string())
+                                        .unwrap_or_default();
+                                    if ui
+                                        .add_sized(
+                                            [320.0, 34.0],
+                                            egui::Button::new(RichText::new(filename).size(14.0)),
+                                        )
+                                        .on_hover_text(path.display().to_string())
+                                        .clicked()
+                                    {
+                                        requested_recent = Some(path);
+                                    }
+                                    ui.label(RichText::new(directory).size(10.5).weak());
+                                    ui.add_space(3.0);
+                                }
+                                if ui
+                                    .add_sized(
+                                        [150.0, 32.0],
+                                        egui::Button::new(
+                                            RichText::new("Clear recent files").size(13.0),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    self.recent_archives.clear();
+                                } else if let Some(path) = requested_recent {
+                                    if path.is_file() {
+                                        self.open_path(path);
+                                    } else {
+                                        self.recent_archives.retain(|recent| recent != &path);
+                                        self.status = format!(
+                                            "Removed missing recent archive: {}",
+                                            path.display()
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    });
             }
         });
         if self.show_new {
             let mut create = false;
             let mut cancel = false;
-            let theme = if self.dark_mode {
-                egui::Theme::Dark
-            } else {
-                egui::Theme::Light
-            };
+            let theme = self.active_theme(&ctx);
             let modal = egui::Modal::new(egui::Id::new("new_archive_modal"))
                 .frame(egui::Frame::popup(&ctx.style_of(theme)).inner_margin(22.0))
                 .show(&ctx, |ui| {
@@ -2191,11 +2523,7 @@ impl eframe::App for HakEditor {
         if self.show_description {
             let mut apply = false;
             let mut cancel = false;
-            let theme = if self.dark_mode {
-                egui::Theme::Dark
-            } else {
-                egui::Theme::Light
-            };
+            let theme = self.active_theme(&ctx);
             let modal = egui::Modal::new(egui::Id::new("archive_description_modal"))
                 .frame(egui::Frame::popup(&ctx.style_of(theme)).inner_margin(22.0))
                 .show(&ctx, |ui| {
@@ -2231,11 +2559,7 @@ impl eframe::App for HakEditor {
         }
         if self.show_about {
             let mut close = false;
-            let theme = if self.dark_mode {
-                egui::Theme::Dark
-            } else {
-                egui::Theme::Light
-            };
+            let theme = self.active_theme(&ctx);
             let modal = egui::Modal::new(egui::Id::new("about_modal"))
                 .frame(egui::Frame::popup(&ctx.style_of(theme)).inner_margin(26.0))
                 .show(&ctx, |ui| {
@@ -2301,8 +2625,9 @@ impl eframe::App for HakEditor {
                 .unwrap_or("incoming resource")
                 .to_owned();
             let mut action = None;
+            let theme = self.active_theme(&ctx);
             let modal = egui::Modal::new(egui::Id::new("resource_conflict_modal"))
-                .frame(egui::Frame::popup(&ctx.style_of(egui::Theme::Dark)).inner_margin(22.0))
+                .frame(egui::Frame::popup(&ctx.style_of(theme)).inner_margin(22.0))
                 .show(&ctx, |ui| {
                     ui.set_min_width(520.0);
                     ui.spacing_mut().item_spacing.y = 11.0;
@@ -2380,8 +2705,9 @@ impl eframe::App for HakEditor {
             let mut save = false;
             let mut discard = false;
             let mut cancel = false;
+            let theme = self.active_theme(&ctx);
             let modal = egui::Modal::new(egui::Id::new("unsaved_changes_modal"))
-                .frame(egui::Frame::popup(&ctx.style_of(egui::Theme::Dark)).inner_margin(22.0))
+                .frame(egui::Frame::popup(&ctx.style_of(theme)).inner_margin(22.0))
                 .show(&ctx, |ui| {
                     ui.set_min_width(450.0);
                     ui.spacing_mut().item_spacing.y = 12.0;
@@ -2401,10 +2727,14 @@ impl eframe::App for HakEditor {
                         .size(17.0),
                     );
                     ui.add_space(6.0);
-                    ui.horizontal_centered(|ui| {
+                    let button_width = 120.0;
+                    let button_spacing = ui.spacing().item_spacing.x;
+                    let button_row_width = button_width * 3.0 + button_spacing * 2.0;
+                    ui.horizontal(|ui| {
+                        ui.add_space(((ui.available_width() - button_row_width) / 2.0).max(0.0));
                         if ui
                             .add_sized(
-                                [120.0, 38.0],
+                                [button_width, 38.0],
                                 egui::Button::new(RichText::new("Save").size(16.0)),
                             )
                             .clicked()
@@ -2413,7 +2743,7 @@ impl eframe::App for HakEditor {
                         }
                         if ui
                             .add_sized(
-                                [120.0, 38.0],
+                                [button_width, 38.0],
                                 egui::Button::new(RichText::new("Discard").size(16.0)),
                             )
                             .clicked()
@@ -2422,7 +2752,7 @@ impl eframe::App for HakEditor {
                         }
                         if ui
                             .add_sized(
-                                [120.0, 38.0],
+                                [button_width, 38.0],
                                 egui::Button::new(RichText::new("Cancel").size(16.0)),
                             )
                             .clicked()
@@ -2458,11 +2788,7 @@ impl eframe::App for HakEditor {
         }
         if let Some(message) = self.error.clone() {
             let mut close = false;
-            let theme = if self.dark_mode {
-                egui::Theme::Dark
-            } else {
-                egui::Theme::Light
-            };
+            let theme = self.active_theme(&ctx);
             let modal = egui::Modal::new(egui::Id::new("error_modal"))
                 .frame(egui::Frame::popup(&ctx.style_of(theme)).inner_margin(24.0))
                 .show(&ctx, |ui| {
@@ -2688,12 +3014,298 @@ fn is_text_type(extension: &str) -> bool {
     )
 }
 
+fn decode_model_preview(bytes: &[u8], total_size: u64) -> Result<ModelPreview, String> {
+    if bytes.len() >= 4 && bytes[..4] == [0, 0, 0, 0] {
+        if bytes.len() < 12 {
+            return Err("The compiled model header is incomplete".into());
+        }
+        let structured_size = u64::from(u32::from_le_bytes(
+            bytes[4..8]
+                .try_into()
+                .expect("the compiled model header length was checked"),
+        ));
+        let raw_size = u64::from(u32::from_le_bytes(
+            bytes[8..12]
+                .try_into()
+                .expect("the compiled model header length was checked"),
+        ));
+        let declared_size = 12_u64
+            .checked_add(structured_size)
+            .and_then(|size| size.checked_add(raw_size))
+            .ok_or_else(|| "The compiled model size fields overflow".to_owned())?;
+        if declared_size > total_size {
+            return Err("The compiled model data ranges exceed the resource size".into());
+        }
+        let name = bytes.get(20..84).and_then(|field| {
+            let end = field
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(field.len());
+            let value = field[..end].to_vec();
+            let value = String::from_utf8(value).ok()?;
+            let value = value.trim();
+            (!value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() || byte == b' '))
+            .then(|| value.to_owned())
+        });
+        return Ok(ModelPreview::Compiled {
+            name,
+            structured_size,
+            raw_size,
+            strings: extract_model_strings(bytes),
+            truncated: total_size > bytes.len() as u64,
+        });
+    }
+
+    if looks_like_ascii_model(bytes) {
+        return Ok(ModelPreview::Uncompiled {
+            text: sanitize_ascii_model_text(bytes),
+            truncated: total_size > bytes.len() as u64,
+        });
+    }
+
+    Err("The resource is neither a compiled Aurora model nor recognizable ASCII MDL source".into())
+}
+
+fn looks_like_ascii_model(bytes: &[u8]) -> bool {
+    let sample = &bytes[..bytes.len().min(16 * 1024)];
+    let non_nul = sample.iter().filter(|byte| **byte != 0).count();
+    let printable = sample
+        .iter()
+        .filter(|byte| **byte != 0 && (byte.is_ascii_graphic() || byte.is_ascii_whitespace()))
+        .count();
+    if non_nul == 0 || printable.saturating_mul(100) < non_nul.saturating_mul(95) {
+        return false;
+    }
+    let text = sanitize_ascii_model_text(sample).to_ascii_lowercase();
+    text.contains("newmodel ")
+        || text.contains("beginmodelgeom ")
+        || text.contains("#maxmodel ascii")
+        || text.contains("# mdl file")
+        || (text.contains("filedependancy ") && text.contains("classification "))
+        || (text.starts_with("<snoopstart ") && text.contains("checking node "))
+}
+
+fn sanitize_ascii_model_text(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .filter_map(|byte| match *byte {
+            0 => None,
+            b'\t' | b'\n' | b'\r' => Some(*byte as char),
+            0x20..=0x7e => Some(*byte as char),
+            _ => Some('\u{fffd}'),
+        })
+        .collect()
+}
+
+fn extract_model_strings(bytes: &[u8]) -> Vec<String> {
+    let allowed = |byte: u8| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'\\' | b':' | b' ')
+    };
+    let mut strings = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut offset = 0;
+    while offset < bytes.len() && strings.len() < MAX_EXTRACTED_MODEL_STRINGS {
+        while offset < bytes.len() && !allowed(bytes[offset]) {
+            offset += 1;
+        }
+        let start = offset;
+        while offset < bytes.len() && allowed(bytes[offset]) {
+            offset += 1;
+        }
+        let length = offset - start;
+        if !(4..=160).contains(&length) {
+            continue;
+        }
+        let value = String::from_utf8_lossy(&bytes[start..offset]);
+        let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        if value.len() < 4
+            || value
+                .bytes()
+                .filter(|byte| byte.is_ascii_alphabetic())
+                .count()
+                < 2
+            || !seen.insert(value.clone())
+        {
+            continue;
+        }
+        strings.push(value);
+    }
+    strings
+}
+
 struct Mp3PreviewInfo {
     version: &'static str,
     bitrate_kbps: u32,
     sample_rate_hz: u32,
     channels: &'static str,
     has_bmu_header: bool,
+}
+
+struct WavPreviewInfo {
+    encoding: &'static str,
+    channels: u16,
+    sample_rate_hz: u32,
+    byte_rate: u32,
+    bits_per_sample: u16,
+    data_size: Option<u64>,
+}
+
+fn show_wav_resource_preview(ui: &mut egui::Ui, bytes: &[u8], total_size: u64) {
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        show_wav_preview(ui, bytes);
+    } else if parse_bmu_mp3_info(bytes).is_ok() {
+        // Aurora archives commonly store BMU-wrapped or plain MP3 payloads
+        // under the WAV resource type. Detect the payload instead of trusting
+        // the archive extension so those resources receive useful details too.
+        show_bmu_preview(ui, bytes, total_size);
+    } else {
+        ui.vertical_centered(|ui| {
+            ui.add_space(80.0);
+            ui.heading("Audio resource");
+            ui.colored_label(
+                Color32::LIGHT_RED,
+                "The WAV resource is neither RIFF/WAVE nor recognizable MP3 audio",
+            );
+        });
+    }
+}
+
+fn show_wav_preview(ui: &mut egui::Ui, bytes: &[u8]) {
+    ui.vertical_centered(|ui| match parse_wav_info(bytes) {
+        Ok(info) => {
+            ui.add_space(55.0);
+            ui.heading("Waveform audio resource");
+            ui.label("RIFF/WAVE audio");
+            ui.add_space(8.0);
+            egui::Grid::new("wav_audio_info")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Encoding:");
+                    ui.label(info.encoding);
+                    ui.end_row();
+                    ui.label("Sample rate:");
+                    ui.label(format!("{} Hz", info.sample_rate_hz));
+                    ui.end_row();
+                    ui.label("Channels:");
+                    ui.label(match info.channels {
+                        1 => "Mono".to_owned(),
+                        2 => "Stereo".to_owned(),
+                        channels => format!("{channels} channels"),
+                    });
+                    ui.end_row();
+                    if info.bits_per_sample > 0 {
+                        ui.label("Bit depth:");
+                        ui.label(format!("{}-bit", info.bits_per_sample));
+                        ui.end_row();
+                    }
+                    if info.byte_rate > 0 {
+                        ui.label("Bitrate:");
+                        ui.label(format!("{} kbit/s", u64::from(info.byte_rate) * 8 / 1000));
+                        ui.end_row();
+                    }
+                    if let (Some(data_size), true) = (info.data_size, info.byte_rate > 0) {
+                        let milliseconds =
+                            data_size.saturating_mul(1000) / u64::from(info.byte_rate);
+                        ui.label("Approx. duration:");
+                        ui.label(format!(
+                            "{}:{:02}.{:03}",
+                            milliseconds / 60_000,
+                            milliseconds / 1000 % 60,
+                            milliseconds % 1000
+                        ));
+                        ui.end_row();
+                    }
+                });
+        }
+        Err(error) => {
+            ui.add_space(80.0);
+            ui.heading("Waveform audio resource");
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
+    });
+}
+
+fn parse_wav_info(bytes: &[u8]) -> Result<WavPreviewInfo, String> {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("The resource does not contain a valid RIFF/WAVE header".into());
+    }
+
+    let mut format = None;
+    let mut data_size = None;
+    let mut offset = 12_usize;
+    while offset.checked_add(8).is_some_and(|end| end <= bytes.len()) {
+        let chunk_id = &bytes[offset..offset + 4];
+        let chunk_size = u32::from_le_bytes(
+            bytes[offset + 4..offset + 8]
+                .try_into()
+                .expect("the chunk header length was checked"),
+        );
+        let content = offset + 8;
+
+        if chunk_id == b"fmt " {
+            if chunk_size < 16 || content + 16 > bytes.len() {
+                return Err("The WAV format chunk is incomplete".into());
+            }
+            let read_u16 = |start: usize| {
+                u16::from_le_bytes(
+                    bytes[start..start + 2]
+                        .try_into()
+                        .expect("the WAV format chunk length was checked"),
+                )
+            };
+            let read_u32 = |start: usize| {
+                u32::from_le_bytes(
+                    bytes[start..start + 4]
+                        .try_into()
+                        .expect("the WAV format chunk length was checked"),
+                )
+            };
+            let format_tag = read_u16(content);
+            format = Some(WavPreviewInfo {
+                encoding: match format_tag {
+                    0x0001 => "PCM",
+                    0x0002 => "Microsoft ADPCM",
+                    0x0003 => "IEEE floating point",
+                    0x0006 => "A-law",
+                    0x0007 => "μ-law",
+                    0x0011 => "IMA ADPCM",
+                    0x0055 => "MPEG Layer III",
+                    0xfffe => "WAVE_FORMAT_EXTENSIBLE",
+                    _ => "Unknown WAV encoding",
+                },
+                channels: read_u16(content + 2),
+                sample_rate_hz: read_u32(content + 4),
+                byte_rate: read_u32(content + 8),
+                bits_per_sample: read_u16(content + 14),
+                data_size: None,
+            });
+        } else if chunk_id == b"data" {
+            data_size = Some(u64::from(chunk_size));
+        }
+
+        let padded_size = u64::from(chunk_size) + u64::from(chunk_size % 2);
+        let Some(next) = (content as u64)
+            .checked_add(padded_size)
+            .and_then(|next| usize::try_from(next).ok())
+        else {
+            return Err("The WAV chunk table is too large".into());
+        };
+        if next <= offset {
+            return Err("The WAV chunk table is invalid".into());
+        }
+        offset = next;
+    }
+
+    let mut info = format.ok_or_else(|| "No WAV format chunk was found".to_owned())?;
+    if info.channels == 0 || info.sample_rate_hz == 0 {
+        return Err("The WAV format contains invalid channel or sample-rate values".into());
+    }
+    info.data_size = data_size;
+    Ok(info)
 }
 
 fn show_bmu_preview(ui: &mut egui::Ui, bytes: &[u8], total_size: u64) {
@@ -3266,5 +3878,86 @@ mod clipboard_tests {
         assert_eq!(info.bitrate_kbps, 128);
         assert_eq!(info.sample_rate_hz, 44_100);
         assert_eq!(info.channels, "Stereo");
+
+        let plain = parse_bmu_mp3_info(&[0xff, 0xfb, 0x90, 0x00])
+            .expect("plain MP3 stored as WAV should be recognized");
+        assert!(!plain.has_bmu_header);
+        assert_eq!(plain.bitrate_kbps, 128);
+    }
+
+    #[test]
+    fn recognizes_pcm_wav_audio() {
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&176_436_u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&44_100_u32.to_le_bytes());
+        wav.extend_from_slice(&176_400_u32.to_le_bytes());
+        wav.extend_from_slice(&4_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&176_400_u32.to_le_bytes());
+
+        let info = parse_wav_info(&wav).expect("PCM WAV header should be recognized");
+        assert_eq!(info.encoding, "PCM");
+        assert_eq!(info.channels, 2);
+        assert_eq!(info.sample_rate_hz, 44_100);
+        assert_eq!(info.byte_rate, 176_400);
+        assert_eq!(info.bits_per_sample, 16);
+        assert_eq!(info.data_size, Some(176_400));
+    }
+
+    #[test]
+    fn distinguishes_ascii_and_compiled_models() {
+        let ascii =
+            b"# mdl file\nnewmodel example\nclassification Character\nbeginmodelgeom example\n";
+        match decode_model_preview(ascii, ascii.len() as u64).expect("ASCII MDL should parse") {
+            ModelPreview::Uncompiled { text, truncated } => {
+                assert!(text.contains("newmodel example"));
+                assert!(!truncated);
+            }
+            ModelPreview::Compiled { .. } => panic!("ASCII MDL was classified as compiled"),
+        }
+
+        let mut compiled = vec![0_u8; 128];
+        compiled[4..8].copy_from_slice(&100_u32.to_le_bytes());
+        compiled[8..12].copy_from_slice(&16_u32.to_le_bytes());
+        compiled[20..33].copy_from_slice(b"example_model");
+        compiled[88..100].copy_from_slice(b"texture_name");
+        match decode_model_preview(&compiled, compiled.len() as u64)
+            .expect("compiled MDL should parse")
+        {
+            ModelPreview::Compiled {
+                name,
+                structured_size,
+                raw_size,
+                strings,
+                truncated,
+            } => {
+                assert_eq!(name.as_deref(), Some("example_model"));
+                assert_eq!(structured_size, 100);
+                assert_eq!(raw_size, 16);
+                assert!(strings.iter().any(|value| value == "texture_name"));
+                assert!(!truncated);
+            }
+            ModelPreview::Uncompiled { .. } => panic!("compiled MDL was classified as ASCII"),
+        }
+
+        let ascii_with_nul_padding =
+            b"#MAXMODEL ASCII\nnewmodel padded\nclassification Character\n\0\0";
+        match decode_model_preview(ascii_with_nul_padding, ascii_with_nul_padding.len() as u64)
+            .expect("NUL-padded ASCII MDL should parse")
+        {
+            ModelPreview::Uncompiled { text, truncated } => {
+                assert!(text.contains("newmodel padded"));
+                assert!(!text.contains('\0'));
+                assert!(!truncated);
+            }
+            ModelPreview::Compiled { .. } => {
+                panic!("NUL-padded ASCII MDL was classified as compiled")
+            }
+        }
     }
 }

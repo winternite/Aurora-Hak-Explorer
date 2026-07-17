@@ -2,6 +2,17 @@
 
 All notable changes to Aurora Hak Explorer are recorded here.
 
+## 1.0.0 — 2026-07-17
+
+- Close archive tabs by middle-clicking them.
+- Scroll the resource list by holding the middle mouse button and dragging.
+- Add a remembered eight-item recent-archives list to the welcome screen.
+- Support opening multiple archives at once from the Open file picker.
+- Refine the welcome-screen archive actions and recent-file controls.
+- Add a remembered System appearance that follows the desktop theme.
+- Display encoding, channel, sample-rate, bitrate, bit-depth, and duration details for RIFF/WAVE resources and MP3 payloads stored under the WAV resource type.
+- Distinguish compiled and uncompiled MDL resources, showing ASCII source for uncompiled models and summary plus extracted-string views for compiled models.
+
 ## 0.3.0 — 2026-07-16
 
 - Refresh the archive tabs and Resource Tree with consistent selection and hover styling.
