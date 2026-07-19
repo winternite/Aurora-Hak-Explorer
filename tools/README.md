@@ -16,5 +16,10 @@ The compiler's BSD-style license and copyright notice are reproduced in
 `../THIRD_PARTY_NOTICES.md`.
 
 The Windows build embeds `windows/nwnmdlcomp.exe` in Aurora Hak Explorer itself.
-It is extracted to a private temporary directory only while a compile or
-decompile operation needs it, so the portable Windows release ships as one EXE.
+It is extracted to a private temporary directory on first use and cached for
+the remainder of that AHE session, so the portable Windows release still ships
+as one EXE without paying repeated extraction and antivirus-scan costs.
+
+AHE invokes the helper's private batch interface for bounded groups of models.
+This reuses one process, workspace, and staged supermodel cache across each
+group while retaining per-model validation and failure reporting.

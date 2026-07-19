@@ -19,8 +19,12 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
-    process::Command,
-    sync::{Arc, OnceLock, mpsc},
+    process::{Command, Stdio},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -187,6 +191,9 @@ struct HakEditor {
     texture_dependencies: TextureDependencies,
     texture_dependency_receiver: Option<mpsc::Receiver<TextureDependencyResult>>,
     resource_view_cache: Option<ResourceViewCache>,
+    model_compiler: Option<Result<ModelCompiler, String>>,
+    model_compile_job: Option<ModelCompileJob>,
+    quit_after_model_compile: bool,
     #[cfg(target_os = "linux")]
     dnd_extract: Option<dnd_extract::Bridge>,
 }
@@ -346,6 +353,34 @@ struct AddBatch {
     entry_lookup: BTreeMap<(String, u16), usize>,
 }
 
+struct ModelCompileJob {
+    receiver: mpsc::Receiver<ModelCompileEvent>,
+    cancel: Arc<AtomicBool>,
+    completed: usize,
+    total: usize,
+    phase: String,
+    current: String,
+}
+
+enum ModelCompileEvent {
+    Progress {
+        completed: usize,
+        phase: String,
+        current: String,
+    },
+    Finished(ModelCompileOutcome),
+}
+
+struct ModelCompileOutcome {
+    exported: usize,
+    skipped: usize,
+    canceled: bool,
+    single_path: Option<PathBuf>,
+    directory: Option<PathBuf>,
+    report_path: Option<PathBuf>,
+    fatal_error: Option<String>,
+}
+
 impl AddBatch {
     fn new(
         paths: Vec<PathBuf>,
@@ -498,6 +533,9 @@ impl HakEditor {
             texture_dependencies: BTreeMap::new(),
             texture_dependency_receiver: None,
             resource_view_cache: None,
+            model_compiler: None,
+            model_compile_job: None,
+            quit_after_model_compile: false,
             #[cfg(target_os = "linux")]
             dnd_extract: dnd_extract::Bridge::new()
                 .map_err(|error| {
@@ -1100,6 +1138,7 @@ impl HakEditor {
     fn blocking_dialog_open(&self) -> bool {
         self.confirm_close_tab.is_some()
             || self.pending_add.is_some()
+            || self.model_compile_job.is_some()
             || self.show_new
             || self.show_description
             || self.show_about
@@ -1632,6 +1671,9 @@ impl HakEditor {
     }
 
     fn compile_selected_models(&mut self) {
+        if self.model_compile_job.is_some() {
+            return;
+        }
         let Some(archive) = self.archive.as_ref() else {
             return;
         };
@@ -1664,135 +1706,116 @@ impl HakEditor {
         let Some((single_path, directory)) = destination else {
             return;
         };
-
-        let compiler = match model_compiler() {
-            Ok(compiler) => compiler,
+        if self.model_compiler.is_none() {
+            self.model_compiler = Some(model_compiler());
+        }
+        let compiler = match self.model_compiler.as_ref().expect("compiler initialized") {
+            Ok(compiler) => compiler.path.clone(),
             Err(error) => {
-                self.fail("Could not compile model", error);
+                self.fail("Could not compile model", error.clone());
                 return;
             }
         };
-        let mut dependency_resolver = ModelDependencyResolver::new(archive, &self.tabs);
 
-        let mut exported = 0usize;
-        let mut skipped = 0usize;
-        let report_path = directory.as_ref().map(|directory| {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_millis());
-            directory.join(format!("AHE-model-compilation-failures-{timestamp}.txt"))
+        let request = ModelCompileRequest {
+            archive: archive.clone(),
+            tabs: self.tabs.clone(),
+            model_indices,
+            compiler,
+            single_path,
+            directory,
+        };
+        let total = request.model_indices.len();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || compile_models_worker(request, worker_cancel, sender));
+        self.model_compile_job = Some(ModelCompileJob {
+            receiver,
+            cancel,
+            completed: 0,
+            total,
+            phase: "Preparing models".into(),
+            current: String::new(),
         });
-        let mut failure_report = None;
-        let mut fatal_failure = None;
-        for index in model_indices {
-            let entry = &archive.entries[index];
-            let filename = match entry.safe_filename() {
-                Ok(filename) => filename,
-                Err(error) => {
-                    let message = format!("{}: {error}", entry.filename());
-                    if let Some(report_path) = report_path.as_ref() {
-                        skipped += 1;
-                        if let Err(error) = append_model_compilation_failure(
-                            &mut failure_report,
-                            report_path,
-                            &message,
-                        ) {
-                            fatal_failure = Some(error);
-                            break;
-                        }
-                        continue;
+        self.status = format!("Compiling {total} model(s)…");
+    }
+
+    fn poll_model_compile_job(&mut self) {
+        let (events, disconnected) = self.model_compile_job.as_ref().map_or_else(
+            || (Vec::new(), false),
+            |job| {
+                let mut events = Vec::new();
+                loop {
+                    match job.receiver.try_recv() {
+                        Ok(event) => events.push(event),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => return (events, true),
                     }
-                    fatal_failure = Some(message);
-                    break;
                 }
-            };
-            let result = (|| -> Result<PathBuf, String> {
-                let size = entry.size().map_err(|error| error.to_string())?;
-                if size > MAX_MODEL_RENDER_BYTES {
-                    return Err(format!(
-                        "{} exceeds the {} compilation limit",
-                        entry.filename(),
-                        human_size(MAX_MODEL_RENDER_BYTES)
-                    ));
+                (events, false)
+            },
+        );
+        for event in events {
+            match event {
+                ModelCompileEvent::Progress {
+                    completed,
+                    phase,
+                    current,
+                } => {
+                    if let Some(job) = self.model_compile_job.as_mut() {
+                        job.completed = completed;
+                        job.phase = phase;
+                        job.current = current;
+                    }
                 }
-                // Read and stage only the current model. Its exact recursive
-                // supermodel chain is resolved below from the current/open
-                // archives and game resources. The workspace is deleted at
-                // the end of this iteration, keeping temporary disk usage
-                // bounded even for selections containing hundreds of
-                // thousands of models.
-                let source = entry.read_prefix(size).map_err(|error| error.to_string())?;
-                let model_workspace = tempfile::Builder::new()
-                    .prefix("ahe-model-compile-")
-                    .tempdir()
-                    .map_err(|error| format!("could not prepare model workspace: {error}"))?;
-                let mut staged_dependencies = BTreeSet::new();
-                staged_dependencies.insert(
-                    filename
-                        .strip_suffix(".mdl")
-                        .unwrap_or(&filename)
-                        .to_ascii_lowercase(),
-                );
-                let _resolved_dependencies = stage_model_dependencies(
-                    &mut dependency_resolver,
-                    &source,
-                    model_workspace.path(),
-                    &mut staged_dependencies,
-                )?;
-                let input = model_workspace.path().join(format!("{filename}.ascii"));
-                fs::write(&input, source).map_err(|error| error.to_string())?;
-                let compiled = run_model_compiler(&compiler.path, model_workspace.path(), &input)?;
-                let destination = single_path
-                    .clone()
-                    .unwrap_or_else(|| directory.as_ref().unwrap().join(&filename));
-                fs::copy(&compiled, &destination).map_err(|error| error.to_string())?;
-                Ok(destination)
-            })();
-            match result {
-                Ok(_) => exported += 1,
-                Err(error) => {
-                    let message = format!("{filename}: {error}");
-                    if let Some(report_path) = report_path.as_ref() {
-                        skipped += 1;
-                        if let Err(error) = append_model_compilation_failure(
-                            &mut failure_report,
-                            report_path,
-                            &message,
-                        ) {
-                            fatal_failure = Some(error);
-                            break;
+                ModelCompileEvent::Finished(outcome) => {
+                    self.model_compile_job = None;
+                    if let Some(error) = outcome.fatal_error {
+                        self.fail("Could not compile model", error);
+                    } else if outcome.canceled {
+                        self.status = format!(
+                            "Compilation canceled — {} model(s) completed",
+                            outcome.exported
+                        );
+                    } else if let Some(path) = outcome.single_path {
+                        self.status = format!("Compiled model to {}", path.display());
+                    } else if let Some(directory) = outcome.directory {
+                        if outcome.skipped == 0 {
+                            self.status = format!(
+                                "Compiled {} models to {}",
+                                outcome.exported,
+                                directory.display()
+                            );
+                        } else if let Some(report_path) = outcome.report_path {
+                            self.status = format!(
+                                "Compiled {} models, skipped {} — report: {}",
+                                outcome.exported,
+                                outcome.skipped,
+                                report_path.display()
+                            );
+                            self.error = Some(format!(
+                                "Compilation completed with skipped models.\n\nCompiled: {}\nSkipped: {}\n\nFailure report:\n{}",
+                                outcome.exported,
+                                outcome.skipped,
+                                report_path.display()
+                            ));
                         }
-                    } else {
-                        fatal_failure = Some(message);
-                        break;
                     }
                 }
             }
         }
-        if let Some(report) = failure_report.as_mut()
-            && let Err(error) = std::io::Write::flush(report)
-        {
-            fatal_failure = Some(format!("could not finish the failure report: {error}"));
+        if disconnected && self.model_compile_job.is_some() {
+            self.model_compile_job = None;
+            self.fail(
+                "Could not compile model",
+                "the background compilation worker stopped unexpectedly",
+            );
         }
-        drop(dependency_resolver);
-        if let Some(error) = fatal_failure {
-            self.fail("Could not compile model", error);
-        } else if let Some(path) = single_path {
-            self.status = format!("Compiled model to {}", path.display());
-        } else if let Some(directory) = directory {
-            if skipped == 0 {
-                self.status = format!("Compiled {exported} models to {}", directory.display());
-            } else {
-                let report_path = report_path.expect("bulk compilation has a report path");
-                self.status = format!(
-                    "Compiled {exported} models, skipped {skipped} — report: {}",
-                    report_path.display()
-                );
-                self.error = Some(format!(
-                    "Compilation completed with skipped models.\n\nCompiled: {exported}\nSkipped: {skipped}\n\nFailure report:\n{}",
-                    report_path.display()
-                ));
-            }
+        if self.model_compile_job.is_none() && self.quit_after_model_compile {
+            self.quit_after_model_compile = false;
+            self.error = None;
+            self.request_quit();
         }
     }
 
@@ -2150,6 +2173,10 @@ impl eframe::App for HakEditor {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_texture_dependencies();
+        self.poll_model_compile_job();
+        if self.model_compile_job.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
         if self
             .pending_add
             .as_ref()
@@ -2219,7 +2246,13 @@ impl eframe::App for HakEditor {
         let ctx = ui.ctx().clone();
         if ctx.input(|input| input.viewport().close_requested()) && !self.force_quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.request_quit();
+            if let Some(job) = self.model_compile_job.as_ref() {
+                job.cancel.store(true, Ordering::Relaxed);
+                self.quit_after_model_compile = true;
+                self.status = "Canceling model compilation before closing…".into();
+            } else {
+                self.request_quit();
+            }
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
         if !self.blocking_dialog_open() {
@@ -3764,6 +3797,47 @@ impl eframe::App for HakEditor {
                 self.quit_in_progress = false;
             }
         }
+        if let Some(job) = self.model_compile_job.as_ref() {
+            let mut cancel = false;
+            let theme = self.active_theme(&ctx);
+            let fraction = if job.total == 0 {
+                0.0
+            } else {
+                job.completed as f32 / job.total as f32
+            };
+            egui::Modal::new(egui::Id::new("model_compilation_modal"))
+                .frame(egui::Frame::popup(&ctx.style_of(theme)).inner_margin(24.0))
+                .show(&ctx, |ui| {
+                    ui.set_min_width(520.0);
+                    ui.spacing_mut().item_spacing.y = 12.0;
+                    ui.label(RichText::new("Compiling models").size(22.0).strong());
+                    ui.separator();
+                    ui.label(RichText::new(&job.phase).size(17.0));
+                    if !job.current.is_empty() {
+                        ui.label(RichText::new(&job.current).monospace());
+                    }
+                    ui.add(
+                        egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                            .show_percentage()
+                            .text(format!("{} of {}", job.completed, job.total)),
+                    );
+                    ui.add_space(5.0);
+                    ui.horizontal_centered(|ui| {
+                        if ui
+                            .add_sized(
+                                [140.0, 38.0],
+                                egui::Button::new(RichText::new("Cancel").size(16.0)),
+                            )
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
+                    });
+                });
+            if cancel {
+                job.cancel.store(true, Ordering::Relaxed);
+            }
+        }
         if let Some(message) = self.error.clone() {
             let mut close = false;
             let theme = self.active_theme(&ctx);
@@ -4109,8 +4183,8 @@ fn stage_model_dependencies_inner(
 
 struct ModelCompiler {
     path: PathBuf,
-    // Retains an extracted embedded helper for exactly as long as the compile
-    // operation needs it. Linux packages use a permanent AppImage helper.
+    // The app retains an extracted Windows helper from first use until exit.
+    // Linux packages use a permanent AppImage helper.
     _temporary_directory: Option<tempfile::TempDir>,
 }
 
@@ -4173,61 +4247,316 @@ fn bundled_model_compiler() -> Result<ModelCompiler, String> {
             "the bundled NWN model compiler could not be found; reinstall Aurora Hak Explorer"
                 .to_string()
         })?;
+    let path = fs::canonicalize(&path).unwrap_or(path);
     Ok(ModelCompiler {
         path,
         _temporary_directory: None,
     })
 }
 
-fn run_model_compiler(compiler: &Path, workspace: &Path, input: &Path) -> Result<PathBuf, String> {
-    let output_path = input.with_extension("");
-    let source_scene = fs::read(input)
-        .ok()
-        .and_then(|source| mdl::parse_scene(&source).ok());
-    #[cfg(target_os = "windows")]
-    let output = Command::new(compiler)
-        .arg("-cqe")
-        .arg(input)
-        .arg(&output_path)
-        .current_dir(workspace)
-        .output();
-    #[cfg(not(target_os = "windows"))]
-    let output = Command::new(compiler)
-        .arg("-cq")
-        // The patched standalone helper accepts an empty resource directory.
-        // It never starts NWN; this argument only preserves its historical CLI.
-        .arg(workspace)
-        .arg(input)
-        .current_dir(workspace)
-        .output();
-    let output = output.map_err(|error| format!("could not start model compiler: {error}"))?;
-    let compiled = fs::read(&output_path).map_err(|error| {
-        let diagnostics = compiler_diagnostics(&output.stdout, &output.stderr);
-        if diagnostics.is_empty() {
-            format!("compiler did not create an output model: {error}")
-        } else {
-            format!("compiler did not create a valid output model: {diagnostics}")
-        }
-    })?;
-    if !valid_compiled_model(&compiled) {
-        let diagnostics = compiler_diagnostics(&output.stdout, &output.stderr);
-        return Err(if diagnostics.is_empty() {
-            "compiler output was not a valid binary MDL".into()
-        } else {
-            format!("compiler output was not a valid binary MDL: {diagnostics}")
-        });
-    }
-    if source_scene
-        .as_ref()
-        .is_some_and(|scene| scene.face_count > 0)
-        && mdl::parse_scene(&compiled).map_or(true, |scene| scene.face_count == 0)
+struct ModelCompileRequest {
+    archive: Archive,
+    tabs: Vec<TabState>,
+    model_indices: Vec<usize>,
+    compiler: PathBuf,
+    single_path: Option<PathBuf>,
+    directory: Option<PathBuf>,
+}
+
+struct PreparedModel {
+    filename: String,
+    input: PathBuf,
+    destination: PathBuf,
+    source_scene: Option<mdl::Scene>,
+}
+
+fn compile_models_worker(
+    request: ModelCompileRequest,
+    cancel: Arc<AtomicBool>,
+    sender: mpsc::Sender<ModelCompileEvent>,
+) {
+    const BATCH_SIZE: usize = 128;
+    let total = request.model_indices.len();
+    let report_path = request.directory.as_ref().map(|directory| {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        directory.join(format!("AHE-model-compilation-failures-{timestamp}.txt"))
+    });
+    let mut outcome = ModelCompileOutcome {
+        exported: 0,
+        skipped: 0,
+        canceled: false,
+        single_path: request.single_path.clone(),
+        directory: request.directory.clone(),
+        report_path: report_path.clone(),
+        fatal_error: None,
+    };
+    let workspace = match tempfile::Builder::new()
+        .prefix("ahe-model-compile-")
+        .tempdir()
     {
-        return Err("compiler dropped the model's renderable mesh geometry".into());
+        Ok(workspace) => workspace,
+        Err(error) => {
+            outcome.fatal_error = Some(format!("could not prepare model workspace: {error}"));
+            let _ = sender.send(ModelCompileEvent::Finished(outcome));
+            return;
+        }
+    };
+    let mut resolver = ModelDependencyResolver::new(&request.archive, &request.tabs);
+    let mut staged_dependencies = BTreeSet::new();
+    let mut failure_report = None;
+    let mut batch = Vec::with_capacity(BATCH_SIZE);
+    let mut visited = 0usize;
+
+    for index in request.model_indices {
+        if cancel.load(Ordering::Relaxed) {
+            outcome.canceled = true;
+            break;
+        }
+        let Some(entry) = request.archive.entries.get(index) else {
+            continue;
+        };
+        let display_name = entry.filename();
+        let prepared = (|| -> Result<PreparedModel, String> {
+            let filename = entry.safe_filename().map_err(|error| error.to_string())?;
+            let size = entry.size().map_err(|error| error.to_string())?;
+            if size > MAX_MODEL_RENDER_BYTES {
+                return Err(format!(
+                    "exceeds the {} compilation limit",
+                    human_size(MAX_MODEL_RENDER_BYTES)
+                ));
+            }
+            let source = entry.read_prefix(size).map_err(|error| error.to_string())?;
+            stage_model_dependencies(
+                &mut resolver,
+                &source,
+                workspace.path(),
+                &mut staged_dependencies,
+            )?;
+            let input = workspace.path().join(format!("{filename}.ascii"));
+            fs::write(&input, &source).map_err(|error| error.to_string())?;
+            let destination = request.single_path.clone().unwrap_or_else(|| {
+                request
+                    .directory
+                    .as_ref()
+                    .expect("bulk compilation has a destination")
+                    .join(&filename)
+            });
+            Ok(PreparedModel {
+                filename,
+                input,
+                destination,
+                source_scene: mdl::parse_scene(&source).ok(),
+            })
+        })();
+        match prepared {
+            Ok(prepared) => batch.push(prepared),
+            Err(error) => {
+                let message = format!("{display_name}: {error}");
+                if let Err(error) = record_model_compilation_failure(
+                    &mut outcome,
+                    &mut failure_report,
+                    report_path.as_deref(),
+                    &message,
+                ) {
+                    outcome.fatal_error = Some(error);
+                    break;
+                }
+            }
+        }
+        visited += 1;
+        if visited.is_multiple_of(16) || visited == total {
+            let _ = sender.send(ModelCompileEvent::Progress {
+                completed: outcome.exported + outcome.skipped,
+                phase: "Preparing models".into(),
+                current: display_name,
+            });
+        }
+        if (batch.len() == BATCH_SIZE || visited == total)
+            && let Err(error) = compile_prepared_batch(
+                &request.compiler,
+                workspace.path(),
+                &mut batch,
+                &staged_dependencies,
+                &cancel,
+                &sender,
+                &mut outcome,
+                &mut failure_report,
+                report_path.as_deref(),
+            )
+        {
+            if error == "canceled" {
+                outcome.canceled = true;
+            } else {
+                outcome.fatal_error = Some(error);
+            }
+            break;
+        }
     }
-    if !output.status.success() {
-        return Err(compiler_diagnostics(&output.stdout, &output.stderr));
+    if let Some(report) = failure_report.as_mut()
+        && let Err(error) = std::io::Write::flush(report)
+    {
+        outcome.fatal_error = Some(format!("could not finish the failure report: {error}"));
     }
-    Ok(output_path)
+    let _ = sender.send(ModelCompileEvent::Finished(outcome));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_prepared_batch(
+    compiler: &Path,
+    workspace: &Path,
+    batch: &mut Vec<PreparedModel>,
+    staged_dependencies: &BTreeSet<String>,
+    cancel: &AtomicBool,
+    sender: &mpsc::Sender<ModelCompileEvent>,
+    outcome: &mut ModelCompileOutcome,
+    failure_report: &mut Option<std::io::BufWriter<fs::File>>,
+    report_path: Option<&Path>,
+) -> Result<(), String> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let _ = sender.send(ModelCompileEvent::Progress {
+        completed: outcome.exported + outcome.skipped,
+        phase: format!("Compiling batch of {} models", batch.len()),
+        current: batch
+            .first()
+            .map_or_else(String::new, |model| model.filename.clone()),
+    });
+    let manifest = workspace.join("ahe-batch-manifest.txt");
+    let manifest_contents = batch
+        .iter()
+        .filter_map(|model| model.input.file_name())
+        .map(|name| name.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&manifest, manifest_contents)
+        .map_err(|error| format!("could not write compiler batch manifest: {error}"))?;
+    let output = run_model_compiler_batch(compiler, workspace, &manifest, cancel)?;
+    let diagnostics = compiler_diagnostics(&output.stdout, &output.stderr);
+
+    for model in batch.drain(..) {
+        let output_path = model.input.with_extension("");
+        let result = (|| -> Result<(), String> {
+            let compiled = fs::read(&output_path).map_err(|error| {
+                if diagnostics.is_empty() {
+                    format!("compiler did not create an output model: {error}")
+                } else {
+                    format!("compiler did not create an output model: {diagnostics}")
+                }
+            })?;
+            if !valid_compiled_model(&compiled) {
+                return Err("compiler output was not a valid binary MDL".into());
+            }
+            if model
+                .source_scene
+                .as_ref()
+                .is_some_and(|scene| scene.face_count > 0)
+                && mdl::parse_scene(&compiled).map_or(true, |scene| scene.face_count == 0)
+            {
+                return Err("compiler dropped the model's renderable mesh geometry".into());
+            }
+            fs::copy(&output_path, &model.destination).map_err(|error| error.to_string())?;
+            Ok(())
+        })();
+        let _ = fs::remove_file(&model.input);
+        let model_name = model
+            .filename
+            .strip_suffix(".mdl")
+            .unwrap_or(&model.filename)
+            .to_ascii_lowercase();
+        if !staged_dependencies.contains(&model_name) {
+            let _ = fs::remove_file(&output_path);
+        }
+        match result {
+            Ok(()) => outcome.exported += 1,
+            Err(error) => {
+                let message = format!("{}: {error}", model.filename);
+                record_model_compilation_failure(outcome, failure_report, report_path, &message)?;
+            }
+        }
+    }
+    let _ = sender.send(ModelCompileEvent::Progress {
+        completed: outcome.exported + outcome.skipped,
+        phase: "Validating compiled models".into(),
+        current: String::new(),
+    });
+    Ok(())
+}
+
+fn run_model_compiler_batch(
+    compiler: &Path,
+    workspace: &Path,
+    manifest: &Path,
+    cancel: &AtomicBool,
+) -> Result<std::process::Output, String> {
+    let mut command = Command::new(compiler);
+    command
+        .arg("--ahe-batch-compile")
+        .arg(manifest)
+        .current_dir(workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not start model compiler: {error}"))?;
+    let stdout = child.stdout.take().map(|mut stdout| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut bytes);
+            bytes
+        })
+    });
+    let stderr = child.stderr.take().map(|mut stderr| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stderr, &mut bytes);
+            bytes
+        })
+    });
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("canceled".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => return Err(format!("could not monitor model compiler: {error}")),
+        }
+    };
+    let stdout = stdout
+        .map(|reader| reader.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = stderr
+        .map(|reader| reader.join().unwrap_or_default())
+        .unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn record_model_compilation_failure(
+    outcome: &mut ModelCompileOutcome,
+    report: &mut Option<std::io::BufWriter<fs::File>>,
+    report_path: Option<&Path>,
+    message: &str,
+) -> Result<(), String> {
+    let Some(report_path) = report_path else {
+        return Err(message.to_owned());
+    };
+    outcome.skipped += 1;
+    append_model_compilation_failure(report, report_path, message)
 }
 
 fn append_model_compilation_failure(
@@ -5941,6 +6270,94 @@ mod clipboard_tests {
         assert!(workspace.path().join("pfg2.mdl").is_file());
         assert!(workspace.path().join("a_fa2.mdl").is_file());
         assert!(origins.iter().all(|origin| origin.contains("open")));
+    }
+
+    #[test]
+    fn bundled_compiler_batches_multiple_models() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = |name: &str| {
+            format!(
+                "newmodel {name}\nsetsupermodel {name} NULL\nbeginmodelgeom {name}\nnode trimesh mesh\n parent NULL\n verts 3\n 0 0 0\n 1 0 0\n 0 1 0\n faces 1\n 0 1 2 1 0 1 2 0\nendnode\nendmodelgeom {name}\ndonemodel {name}\n"
+            )
+        };
+        fs::write(workspace.path().join("first.mdl.ascii"), source("first")).unwrap();
+        fs::write(workspace.path().join("second.mdl.ascii"), source("second")).unwrap();
+        let manifest = workspace.path().join("manifest.txt");
+        fs::write(&manifest, "first.mdl.ascii\nsecond.mdl.ascii\n").unwrap();
+        let compiler = bundled_model_compiler().unwrap();
+        let output = run_model_compiler_batch(
+            &compiler.path,
+            workspace.path(),
+            &manifest,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            compiler_diagnostics(&output.stdout, &output.stderr)
+        );
+        assert!(valid_compiled_model(
+            &fs::read(workspace.path().join("first.mdl")).unwrap()
+        ));
+        assert!(valid_compiled_model(
+            &fs::read(workspace.path().join("second.mdl")).unwrap()
+        ));
+    }
+
+    #[test]
+    fn background_compilation_pipeline_exports_and_validates_models() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source = |name: &str| {
+            format!(
+                "newmodel {name}\nsetsupermodel {name} NULL\nbeginmodelgeom {name}\nnode trimesh mesh\n parent NULL\n verts 3\n 0 0 0\n 1 0 0\n 0 1 0\n tverts 3\n 0 0 0\n 1 0 0\n 0 1 0\n faces 1\n 0 1 2 1 0 1 2 0\nendnode\nendmodelgeom {name}\ndonemodel {name}\n"
+            )
+        };
+        let mut archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        for index in 0..130 {
+            let name = format!("m{index:03}");
+            let path = source_directory.path().join(format!("{name}.mdl"));
+            fs::write(&path, source(&name)).unwrap();
+            archive.add_file(&path).unwrap();
+        }
+        let compiler = bundled_model_compiler().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        compile_models_worker(
+            ModelCompileRequest {
+                archive,
+                tabs: Vec::new(),
+                model_indices: (0..130).collect(),
+                compiler: compiler.path.clone(),
+                single_path: None,
+                directory: Some(destination.path().to_path_buf()),
+            },
+            Arc::new(AtomicBool::new(false)),
+            sender,
+        );
+        let outcome = receiver
+            .into_iter()
+            .find_map(|event| match event {
+                ModelCompileEvent::Finished(outcome) => Some(outcome),
+                ModelCompileEvent::Progress { .. } => None,
+            })
+            .unwrap();
+
+        let report = outcome
+            .report_path
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        assert!(outcome.fatal_error.is_none(), "{:?}", outcome.fatal_error);
+        assert_eq!(outcome.exported, 130, "{report}");
+        assert_eq!(outcome.skipped, 0, "{report}");
+        assert!(valid_compiled_model(
+            &fs::read(destination.path().join("m000.mdl")).unwrap()
+        ));
+        assert!(valid_compiled_model(
+            &fs::read(destination.path().join("m129.mdl")).unwrap()
+        ));
     }
 
     #[cfg(target_os = "windows")]

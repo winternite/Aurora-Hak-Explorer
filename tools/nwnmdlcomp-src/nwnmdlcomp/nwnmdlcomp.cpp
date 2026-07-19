@@ -532,7 +532,8 @@ bool Compile (unsigned char *pauchData, UINT32 ulSize,
     // Issue message
     //
 
-    printf ("Compiling: %s\n", pszInFile);
+    if (!g_fQuiet)
+        printf ("Compiling: %s\n", pszInFile);
 
     //
     // Make sure it looks ascii
@@ -904,6 +905,47 @@ int main (int argc, char *argv [])
     char *pszNWNDir = NULL;
     char **papszInFiles = NULL;
     int nInFileCount = 0;
+
+    // AHE batch mode deliberately bypasses the historical one-input Windows
+    // command line. Each manifest line names one staged .mdl.ascii source;
+    // outputs are written beside those sources using the normal compiler
+    // naming rules. One helper process can therefore compile a bounded batch
+    // without changing the Aurora binary format or parser.
+    if (argc == 3 && strcmp (argv [1], "--ahe-batch-compile") == 0)
+    {
+        FILE *pfManifest = fopen (argv [2], "rt");
+        if (pfManifest == NULL)
+        {
+            fprintf (stderr, "Unable to open AHE batch manifest: %s\n", argv [2]);
+            return 2;
+        }
+        g_fQuiet = true;
+        g_fCompile = true;
+        g_fDisableExtension = false;
+        int nFailures = 0;
+        char szInput [1024];
+        while (fgets (szInput, sizeof (szInput), pfManifest) != NULL)
+        {
+            size_t nLength = strlen (szInput);
+            while (nLength > 0 &&
+                   (szInput [nLength - 1] == '\r' || szInput [nLength - 1] == '\n'))
+                szInput [--nLength] = 0;
+            if (nLength == 0)
+                continue;
+            UINT32 ulSize = 0;
+            unsigned char *pauchData = NwnLoadFile (szInput, &ulSize);
+            bool fSuccess = pauchData != NULL &&
+                Compile (pauchData, ulSize, szInput, NULL);
+            printf ("AHE_RESULT\t%s\t%s\n", szInput,
+                    fSuccess ? "OK" : "FAILED");
+            if (!fSuccess)
+                nFailures++;
+        }
+        fclose (pfManifest);
+        g_sCache .ClearCache ();
+        g_sLoader .Close ();
+        return nFailures == 0 ? 0 : 1;
+    }
 
     //
     // Enable leak checking
