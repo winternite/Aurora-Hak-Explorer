@@ -3,14 +3,16 @@ use std::{
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        OnceLock,
-        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
 use crate::resource_types::{extension_for, type_for};
 
 const HEADER_SIZE: u64 = 160;
+const BIF_HEADER_SIZE: u64 = 20;
+const BIF_RESOURCE_ENTRY_SIZE: u64 = 16;
 const MAX_ARCHIVE_ENTRIES: usize = 1_000_000;
 const MAX_LOCALIZED_STRING_TABLE_SIZE: u64 = 64 * 1024 * 1024;
 static NEXT_ARCHIVE_ID: AtomicU64 = AtomicU64::new(1);
@@ -48,6 +50,7 @@ pub enum ArchiveKind {
     Erf,
     Mod,
     Sav,
+    Bif,
 }
 
 impl ArchiveKind {
@@ -56,6 +59,7 @@ impl ArchiveKind {
             Self::Hak => b"HAK ",
             Self::Erf => b"ERF ",
             Self::Mod | Self::Sav => b"MOD ",
+            Self::Bif => b"BIFF",
         }
     }
     pub fn extension(self) -> &'static str {
@@ -64,7 +68,12 @@ impl ArchiveKind {
             Self::Erf => "erf",
             Self::Mod => "mod",
             Self::Sav => "sav",
+            Self::Bif => "bif",
         }
+    }
+
+    pub fn is_editable(self) -> bool {
+        self != Self::Bif
     }
 }
 
@@ -137,6 +146,12 @@ impl Entry {
         }
     }
 
+    pub fn export_to(&self, output: impl AsRef<Path>) -> io::Result<()> {
+        let mut writer = BufWriter::new(File::create(output)?);
+        self.copy_to(&mut writer)?;
+        writer.flush()
+    }
+
     pub fn read_prefix(&self, limit: u64) -> io::Result<Vec<u8>> {
         let mut data = Vec::new();
         match &self.data {
@@ -202,6 +217,14 @@ impl Archive {
         (self.identity, self.view_revision)
     }
 
+    pub fn version_label(&self) -> &'static str {
+        if self.kind == ArchiveKind::Bif {
+            "V1 (BioWare BIFF)"
+        } else {
+            self.version.label()
+        }
+    }
+
     pub fn mark_resources_changed(&mut self) {
         self.view_revision = self.view_revision.wrapping_add(1);
     }
@@ -227,12 +250,18 @@ impl Archive {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file_len = fs::metadata(&path)?.len();
-        if file_len < HEADER_SIZE {
-            return Err(invalid("file is too small to be an ERF archive"));
+        if file_len < 4 {
+            return Err(invalid("file is too small to be an NWN archive"));
         }
         let mut input = BufReader::new(File::open(&path)?);
         let mut signature = [0; 4];
         input.read_exact(&mut signature)?;
+        if &signature == b"BIFF" {
+            return Self::open_bif(path, file_len, input);
+        }
+        if file_len < HEADER_SIZE {
+            return Err(invalid("file is too small to be an ERF archive"));
+        }
         let kind = match &signature {
             b"HAK " => ArchiveKind::Hak,
             b"ERF " => ArchiveKind::Erf,
@@ -418,6 +447,74 @@ impl Archive {
         })
     }
 
+    fn open_bif(path: PathBuf, file_len: u64, mut input: BufReader<File>) -> io::Result<Self> {
+        if file_len < BIF_HEADER_SIZE {
+            return Err(invalid("BIF header is truncated"));
+        }
+        let mut version = [0_u8; 4];
+        input.read_exact(&mut version)?;
+        if &version != b"V1  " {
+            return Err(invalid("unsupported BIF version"));
+        }
+        let entry_count = read_u32(&mut input)? as usize;
+        let _fixed_resource_count = read_u32(&mut input)?;
+        let table_offset = read_u32(&mut input)? as u64;
+        if entry_count > MAX_ARCHIVE_ENTRIES {
+            return Err(invalid(format!(
+                "BIF contains more than {MAX_ARCHIVE_ENTRIES} resources"
+            )));
+        }
+        let table_size = (entry_count as u64)
+            .checked_mul(BIF_RESOURCE_ENTRY_SIZE)
+            .ok_or_else(|| invalid("BIF resource table is too large"))?;
+        check_range(table_offset, table_size, file_len, "BIF resource table")?;
+
+        input.seek(SeekFrom::Start(table_offset))?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve(entry_count)
+            .map_err(|_| invalid("BIF resource list is too large"))?;
+        for index in 0..entry_count {
+            let resource_id = read_u32(&mut input)?;
+            let offset = read_u32(&mut input)? as u64;
+            let size = read_u32(&mut input)? as u64;
+            let raw_type = read_u32(&mut input)?;
+            let type_id = u16::try_from(raw_type)
+                .map_err(|_| invalid("BIF resource type exceeds the supported 16-bit range"))?;
+            if resource_id & 0x000f_ffff != index as u32 {
+                return Err(invalid(
+                    "BIF resource IDs do not match their table positions",
+                ));
+            }
+            check_range(offset, size, file_len, "BIF resource data")?;
+            entries.push(Entry {
+                // Directly opened BIFs have no resrefs. Match NWN Explorer's
+                // stable synthetic naming scheme so resources can be viewed
+                // and extracted without a companion KEY file.
+                name: format!("res{index}"),
+                type_id,
+                data: EntryData::ArchiveSlice {
+                    path: path.clone(),
+                    offset,
+                    size,
+                },
+                model_compiled: OnceLock::new(),
+            });
+        }
+        populate_model_kind_cache(&mut input, &entries)?;
+        entries.sort_by_key(|entry| (entry.name.to_ascii_lowercase(), entry.type_id));
+        Ok(Self {
+            kind: ArchiveKind::Bif,
+            version: ArchiveVersion::V1_0,
+            path: Some(path),
+            entries,
+            localized: Vec::new(),
+            description_strref: u32::MAX,
+            identity: NEXT_ARCHIVE_ID.fetch_add(1, Ordering::Relaxed),
+            view_revision: 0,
+        })
+    }
+
     #[cfg(test)]
     pub fn add_file(&mut self, path: impl AsRef<Path>) -> io::Result<bool> {
         let entry = self.entry_from_file(path.as_ref())?;
@@ -438,19 +535,31 @@ impl Archive {
     /// Returns the archive key and display filename an incoming resource would use.
     /// This lets the UI build one lookup table for a large import instead of
     /// repeatedly scanning every entry already in the archive.
-    pub fn incoming_file_identity(&self, path: impl AsRef<Path>) -> io::Result<(String, u16)> {
-        let entry = self.entry_from_file(path.as_ref())?;
-        Ok((entry.name.to_ascii_lowercase(), entry.type_id))
+    pub fn prepare_incoming_file(&self, path: impl AsRef<Path>) -> io::Result<Entry> {
+        self.entry_from_file(path.as_ref())
+    }
+
+    pub fn incoming_entry_identity(entry: &Entry) -> (String, u16) {
+        (entry.name.to_ascii_lowercase(), entry.type_id)
     }
 
     /// Adds or replaces one resource without sorting or bumping the view
     /// revision. Call `finish_bulk_add` once after the complete batch.
+    #[cfg(test)]
     pub fn add_file_unsorted(
         &mut self,
         path: impl AsRef<Path>,
         replacement_index: Option<usize>,
     ) -> io::Result<bool> {
         let entry = self.entry_from_file(path.as_ref())?;
+        self.add_prepared_entry_unsorted(entry, replacement_index)
+    }
+
+    pub fn add_prepared_entry_unsorted(
+        &mut self,
+        entry: Entry,
+        replacement_index: Option<usize>,
+    ) -> io::Result<bool> {
         if let Some(index) = replacement_index {
             let existing = self
                 .entries
@@ -493,7 +602,8 @@ impl Archive {
     }
 
     fn entry_from_file(&self, path: &Path) -> io::Result<Entry> {
-        if !path.is_file() {
+        let metadata = fs::metadata(path)?;
+        if !metadata.is_file() {
             return Err(invalid("resource is not a regular file"));
         }
         let file_name = path
@@ -542,9 +652,7 @@ impl Archive {
             .entries
             .get(index)
             .ok_or_else(|| invalid("resource index is out of range"))?;
-        let mut writer = BufWriter::new(File::create(output)?);
-        entry.copy_to(&mut writer)?;
-        writer.flush()
+        entry.export_to(output)
     }
 
     pub fn extract_all(&self, directory: impl AsRef<Path>) -> io::Result<usize> {
@@ -556,6 +664,9 @@ impl Archive {
     }
 
     pub fn save(&mut self, output: impl AsRef<Path>) -> io::Result<()> {
+        if !self.kind.is_editable() {
+            return Err(invalid("BIF archives are read-only"));
+        }
         let output = output.as_ref();
         let existing_permissions = fs::metadata(output)
             .ok()
@@ -662,6 +773,77 @@ impl Archive {
     }
 }
 
+pub fn export_entries_parallel(resources: &[(Entry, PathBuf)]) -> io::Result<()> {
+    if resources.is_empty() {
+        return Ok(());
+    }
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(8)
+        .min(resources.len());
+    if workers == 1 || resources.len() < 128 {
+        for (entry, output) in resources {
+            entry.export_to(output)?;
+        }
+        return Ok(());
+    }
+
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let first_error = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                while !failed.load(Ordering::Relaxed) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((entry, output)) = resources.get(index) else {
+                        break;
+                    };
+                    if let Err(error) = entry.export_to(output) {
+                        failed.store(true, Ordering::Relaxed);
+                        if let Ok(mut slot) = first_error.lock()
+                            && slot.is_none()
+                        {
+                            *slot = Some(error);
+                        }
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    match first_error.into_inner() {
+        Ok(Some(error)) => Err(error),
+        Ok(None) => Ok(()),
+        Err(_) => Err(io::Error::other("parallel export worker failed")),
+    }
+}
+
+fn populate_model_kind_cache(input: &mut (impl Read + Seek), entries: &[Entry]) -> io::Result<()> {
+    let Some(model_type) = type_for("mdl") else {
+        return Ok(());
+    };
+    for entry in entries {
+        if entry.type_id != model_type {
+            continue;
+        }
+        let EntryData::ArchiveSlice { offset, size, .. } = &entry.data else {
+            continue;
+        };
+        let compiled = if *size < 4 {
+            None
+        } else {
+            input.seek(SeekFrom::Start(*offset))?;
+            let mut prefix = [0; 4];
+            input.read_exact(&mut prefix)?;
+            Some(prefix == [0, 0, 0, 0])
+        };
+        let _ = entry.model_compiled.set(compiled);
+    }
+    Ok(())
+}
+
 fn erf_build_date(mut days_since_epoch: u64) -> (u32, u32) {
     let mut year = 1970_u32;
     loop {
@@ -754,6 +936,33 @@ mod tests {
         let extracted = dir.path().join("sample.2da");
         loaded.export_entry(0, &extracted).unwrap();
         assert_eq!(fs::read(extracted).unwrap(), b"2DA V2.0\n");
+    }
+
+    #[test]
+    fn opens_and_extracts_direct_bif_resources_with_nwn_explorer_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.bif");
+        let payload = b"2DA V2.0\n";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"BIFFV1  ");
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&20_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&36_u32.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0x07e1_u32.to_le_bytes());
+        bytes.extend_from_slice(payload);
+        fs::write(&path, bytes).unwrap();
+
+        let mut archive = Archive::open(&path).unwrap();
+        assert_eq!(archive.kind, ArchiveKind::Bif);
+        assert_eq!(archive.entries.len(), 1);
+        assert_eq!(archive.entries[0].filename(), "res0.2da");
+        let extracted = dir.path().join("res0.2da");
+        archive.export_entry(0, &extracted).unwrap();
+        assert_eq!(fs::read(extracted).unwrap(), payload);
+        assert!(archive.save(dir.path().join("rewritten.bif")).is_err());
     }
     #[test]
     fn rejects_bad_ranges() {
@@ -943,5 +1152,26 @@ mod tests {
         assert!(archive.add_file_unsorted(&first, Some(0)).unwrap());
         archive.finish_bulk_add();
         assert_eq!(archive.entries[0].read_prefix(64).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn parallel_export_writes_every_resource() {
+        let output = tempfile::tempdir().unwrap();
+        let resources = (0_usize..256)
+            .map(|index| {
+                let entry = Entry {
+                    name: format!("item{index}"),
+                    type_id: 0x000a,
+                    data: EntryData::Memory(index.to_le_bytes().to_vec()),
+                    model_compiled: OnceLock::new(),
+                };
+                let path = output.path().join(format!("item{index}.txt"));
+                (entry, path)
+            })
+            .collect::<Vec<_>>();
+        export_entries_parallel(&resources).unwrap();
+        for (index, (_, path)) in resources.iter().enumerate() {
+            assert_eq!(fs::read(path).unwrap(), index.to_le_bytes());
+        }
     }
 }

@@ -31,6 +31,7 @@ fn set_pointer_position(x: i32, y: i32) {
     POINTER_POSITION.store(((x as i64) << 32) | y as u32 as i64, Ordering::Relaxed);
 }
 
+use crate::archive::{self, Entry};
 use tempfile::TempDir;
 use x11rb::{
     COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, CURRENT_TIME, NONE,
@@ -133,13 +134,14 @@ pub fn release_pointer_grab(frame: &eframe::Frame) {
 pub fn start(
     _frame: &eframe::Frame,
     paths: Vec<PathBuf>,
+    resources: Vec<(Entry, PathBuf)>,
     temporary_directory: TempDir,
     archive_offer: Option<ArchiveExtractOffer>,
 ) {
     cleanup_abandoned_drag_directories();
     let file_count = paths.len();
     thread::spawn(move || {
-        if let Err(error) = run(paths, archive_offer) {
+        if let Err(error) = run(paths, resources, archive_offer) {
             eprintln!("Could not start outgoing file drag: {error}");
         } else {
             // File managers commonly acknowledge XDND before their copy job
@@ -212,20 +214,18 @@ fn retain_temporary_directory(directory: TempDir, file_count: usize) {
         });
         sender
     });
-    if let Err(error) = sender.send((directory, drag_retention(file_count))) {
+    let retention = drag_retention(file_count);
+    crate::drag_cleanup::register(directory.path(), retention);
+    if let Err(error) = sender.send((directory, retention)) {
         drop(error.0.0);
     }
 }
 
-fn drag_retention(file_count: usize) -> Duration {
-    // XDND acknowledges a drop before some file managers have finished their
-    // asynchronous copy job. Large selections therefore need a longer-lived
-    // staging directory than ordinary drags. Cap it so a receiver that dies
-    // cannot retain temporary resources indefinitely.
-    const BASE_SECONDS: u64 = 5 * 60;
-    const MAX_SECONDS: u64 = 2 * 60 * 60;
-    let per_file = u64::try_from(file_count).unwrap_or(u64::MAX) / 100;
-    Duration::from_secs(BASE_SECONDS.saturating_add(per_file).min(MAX_SECONDS))
+fn drag_retention(_file_count: usize) -> Duration {
+    // Some file managers acknowledge XDND before their asynchronous copy job
+    // has opened every source URI. Keep completed drags available for a short,
+    // fixed grace period; the durable helper guarantees cleanup after exit.
+    Duration::from_secs(60)
 }
 
 const INCR_THRESHOLD_BYTES: usize = 256 * 1024;
@@ -239,7 +239,30 @@ struct IncrementalTransfer {
     offset: usize,
 }
 
-fn run(paths: Vec<PathBuf>, archive_offer: Option<ArchiveExtractOffer>) -> Result<(), String> {
+struct LazyStaging {
+    resources: Option<Vec<(Entry, PathBuf)>>,
+}
+
+impl LazyStaging {
+    fn new(resources: Vec<(Entry, PathBuf)>) -> Self {
+        Self {
+            resources: Some(resources),
+        }
+    }
+
+    fn ensure_ready(&mut self) -> Result<(), String> {
+        let Some(resources) = self.resources.take() else {
+            return Ok(());
+        };
+        archive::export_entries_parallel(&resources).map_err(|error| error.to_string())
+    }
+}
+
+fn run(
+    paths: Vec<PathBuf>,
+    resources: Vec<(Entry, PathBuf)>,
+    archive_offer: Option<ArchiveExtractOffer>,
+) -> Result<(), String> {
     POINTER_POSITION.store(NO_POINTER_POSITION, Ordering::Relaxed);
     let (connection, screen_number) = x11rb::connect(None).map_err(|error| error.to_string())?;
     let root = connection.setup().roots[screen_number].root;
@@ -310,6 +333,7 @@ fn run(paths: Vec<PathBuf>, archive_offer: Option<ArchiveExtractOffer>) -> Resul
     }
 
     let uri_list = uri_list(&paths);
+    let mut staging = LazyStaging::new(resources);
     let mut target = NONE;
     let mut accepted = false;
     let mut last_time = CURRENT_TIME;
@@ -373,14 +397,20 @@ fn run(paths: Vec<PathBuf>, archive_offer: Option<ArchiveExtractOffer>) -> Resul
                     atoms,
                     &uri_list,
                     archive_offer.as_ref(),
+                    &mut staging,
                     transfers,
                 )?;
                 break;
             }
             Event::SelectionRequest(event) => {
-                if let Some(transfer) =
-                    serve_selection(&connection, event, atoms, &uri_list, archive_offer.as_ref())?
-                {
+                if let Some(transfer) = serve_selection(
+                    &connection,
+                    event,
+                    atoms,
+                    &uri_list,
+                    archive_offer.as_ref(),
+                    &mut staging,
+                )? {
                     replace_transfer(&mut transfers, transfer);
                 }
             }
@@ -409,6 +439,7 @@ fn finish_drag(
     atoms: Atoms,
     uri_list: &[u8],
     archive_offer: Option<&ArchiveExtractOffer>,
+    staging: &mut LazyStaging,
     mut transfers: Vec<IncrementalTransfer>,
 ) -> Result<(), String> {
     if target == NONE || !accepted {
@@ -435,7 +466,7 @@ fn finish_drag(
         {
             Some(Event::SelectionRequest(event)) => {
                 if let Some(transfer) =
-                    serve_selection(connection, event, atoms, uri_list, archive_offer)?
+                    serve_selection(connection, event, atoms, uri_list, archive_offer, staging)?
                 {
                     replace_transfer(&mut transfers, transfer);
                 }
@@ -482,6 +513,7 @@ fn serve_selection(
     atoms: Atoms,
     uri_list: &[u8],
     archive_offer: Option<&ArchiveExtractOffer>,
+    staging: &mut LazyStaging,
 ) -> Result<Option<IncrementalTransfer>, String> {
     let property = if event.property == NONE {
         event.target
@@ -542,6 +574,7 @@ fn serve_selection(
         || event.target == atoms.utf8_string
         || event.target == AtomEnum::STRING.into()
     {
+        staging.ensure_ready()?;
         if uri_list.len() >= INCR_THRESHOLD_BYTES {
             connection
                 .change_window_attributes(
@@ -742,8 +775,26 @@ mod tests {
     }
 
     #[test]
-    fn large_drags_retain_their_staging_directory_longer() {
-        assert!(drag_retention(40_000) > drag_retention(10_000));
-        assert!(drag_retention(500_000) <= Duration::from_secs(2 * 60 * 60));
+    fn completed_drags_use_a_one_minute_retention() {
+        assert_eq!(drag_retention(1), Duration::from_secs(60));
+        assert_eq!(drag_retention(500_000), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn generic_uri_drag_stages_resources_only_when_requested() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source_path = source.path().join("resource.txt");
+        let staged_path = destination.path().join("resource.txt");
+        fs::write(&source_path, b"lazy export").unwrap();
+        let archive = crate::archive::Archive::new(
+            crate::archive::ArchiveKind::Hak,
+            crate::archive::ArchiveVersion::V1_0,
+        );
+        let entry = archive.prepare_incoming_file(&source_path).unwrap();
+        let mut staging = LazyStaging::new(vec![(entry, staged_path.clone())]);
+        assert!(!staged_path.exists());
+        staging.ensure_ready().unwrap();
+        assert_eq!(fs::read(staged_path).unwrap(), b"lazy export");
     }
 }

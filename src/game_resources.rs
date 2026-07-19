@@ -28,11 +28,22 @@ pub struct GameResourceIndex {
 impl GameResourceIndex {
     pub fn build(install_roots: &[PathBuf], resource_type: u16) -> Self {
         let mut key_files = Vec::new();
-        for root in install_roots {
-            collect_key_files(root, 0, &mut key_files);
+        let mut seen = BTreeMap::<PathBuf, ()>::new();
+        // Resource lookup walks locations in reverse insertion order. Index
+        // lower-priority roots first so the user's preferred installation
+        // (the first root) wins when multiple installations contain a resref.
+        for root in install_roots.iter().rev() {
+            let mut root_key_files = Vec::new();
+            collect_key_files(root, 0, &mut root_key_files);
+            root_key_files.sort();
+            root_key_files.dedup();
+            for key_file in root_key_files {
+                let canonical = fs::canonicalize(&key_file).unwrap_or(key_file);
+                if seen.insert(canonical.clone(), ()).is_none() {
+                    key_files.push(canonical);
+                }
+            }
         }
-        key_files.sort();
-        key_files.dedup();
         let mut resources = BTreeMap::<(String, u16), Vec<ResourceLocation>>::new();
         for key_path in key_files {
             let _ = index_key_file(&key_path, resource_type, &mut resources);
@@ -262,12 +273,9 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    #[test]
-    fn indexes_and_reads_a_key_bif_resource() {
-        let directory = tempfile::tempdir().unwrap();
-        let data_directory = directory.path().join("data");
-        fs::create_dir(&data_directory).unwrap();
-        let payload = b"compiled model payload";
+    fn write_installation(root: &Path, payload: &[u8]) -> PathBuf {
+        let data_directory = root.join("data");
+        fs::create_dir_all(&data_directory).unwrap();
 
         let mut bif = Vec::new();
         bif.extend_from_slice(b"BIFFV1  ");
@@ -301,10 +309,32 @@ mod tests {
         key.extend_from_slice(&0x07d2_u16.to_le_bytes());
         key.extend_from_slice(&0_u32.to_le_bytes());
         fs::write(data_directory.join("test.key"), key).unwrap();
+        data_directory
+    }
+
+    #[test]
+    fn indexes_and_reads_a_key_bif_resource() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload = b"compiled model payload";
+        let data_directory = write_installation(directory.path(), payload);
 
         let index = GameResourceIndex::build(&[directory.path().to_path_buf()], 0x07d2);
         let (loaded, origin) = index.load("PFG2", 0x07d2).unwrap().unwrap();
         assert_eq!(loaded, payload);
         assert_eq!(origin, data_directory.join("test.bif"));
+    }
+
+    #[test]
+    fn preferred_installation_wins_duplicate_resource_lookup() {
+        let directory = tempfile::tempdir().unwrap();
+        let preferred = directory.path().join("preferred");
+        let fallback = directory.path().join("fallback");
+        let preferred_data = write_installation(&preferred, b"preferred model");
+        write_installation(&fallback, b"fallback model");
+
+        let index = GameResourceIndex::build(&[preferred, fallback], 0x07d2);
+        let (loaded, origin) = index.load("pfg2", 0x07d2).unwrap().unwrap();
+        assert_eq!(loaded, b"preferred model");
+        assert_eq!(origin, preferred_data.join("test.bif"));
     }
 }

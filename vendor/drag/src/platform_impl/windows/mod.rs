@@ -11,7 +11,6 @@ use std::{
     iter::once,
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
-    sync::Once,
 };
 use windows::{
     core::*,
@@ -20,7 +19,7 @@ use windows::{
         Graphics::Gdi::{GetObjectW, BITMAP},
         System::Com::*,
         System::Memory::*,
-        System::Ole::{DoDragDrop, OleInitialize},
+        System::Ole::{DoDragDrop, OleInitialize, OleUninitialize},
         System::Ole::{
             IDropSource, IDropSource_Impl, CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE,
         },
@@ -28,7 +27,8 @@ use windows::{
         UI::{
             Shell::{
                 BHID_DataObject, CLSID_DragDropHelper, Common, IDragSourceHelper, IShellItemArray,
-                SHCreateDataObject, SHCreateShellItemArrayFromIDLists, DROPFILES, SHDRAGIMAGE,
+                ILFree, SHCreateDataObject, SHCreateShellItemArrayFromIDLists, DROPFILES,
+                SHDRAGIMAGE,
             },
             WindowsAndMessaging::GetCursorPos,
         },
@@ -37,16 +37,27 @@ use windows::{
 
 mod image;
 
-static mut OLE_RESULT: Result<()> = Ok(());
-static OLE_UNINITIALIZE: Once = Once::new();
-fn init_ole() {
-    OLE_UNINITIALIZE.call_once(|| {
-        unsafe {
-            OLE_RESULT = OleInitialize(Some(std::ptr::null_mut()));
-        }
-        // I guess we never deinitialize for now?
-        // OleUninitialize
-    });
+struct OleGuard;
+
+impl OleGuard {
+    fn initialize() -> Result<Self> {
+        unsafe { OleInitialize(Some(std::ptr::null_mut()))? };
+        Ok(Self)
+    }
+}
+
+impl Drop for OleGuard {
+    fn drop(&mut self) {
+        unsafe { OleUninitialize() };
+    }
+}
+
+struct ItemIdList(*mut Common::ITEMIDLIST);
+
+impl Drop for ItemIdList {
+    fn drop(&mut self) {
+        unsafe { ILFree(Some(self.0.cast_const())) };
+    }
 }
 
 #[implement(IDataObject)]
@@ -106,14 +117,12 @@ impl IDropSource_Impl for DummyDropSource {
 }
 
 impl DataObject {
-    // This will be used for sharing text between applications
-    #[allow(dead_code)]
-    fn new(files: Vec<PathBuf>) -> Self {
+    fn new(files: Vec<PathBuf>) -> Result<Self> {
         unsafe {
-            Self {
+            Ok(Self {
                 files,
-                inner_shell_obj: SHCreateDataObject(None, None, None).unwrap(),
-            }
+                inner_shell_obj: SHCreateDataObject(None, None, None)?,
+            })
         }
     }
 
@@ -222,20 +231,20 @@ pub fn start_drag<W: HasWindowHandle, F: Fn(DragResult, CursorPosition) + Send +
     if let Ok(RawWindowHandle::Win32(_w)) = handle.window_handle().map(|h| h.as_raw()) {
         match item {
             DragItem::Files(files) => {
-                init_ole();
-                unsafe {
-                    #[allow(static_mut_refs)]
-                    if let Err(e) = &OLE_RESULT {
-                        return Err(e.clone().into());
-                    }
-                }
+                let _ole = OleGuard::initialize()?;
 
-                let mut paths = Vec::new();
-                for f in files {
-                    paths.push(dunce::canonicalize(f)?);
-                }
+                let paths = files
+                    .into_iter()
+                    .map(|path| {
+                        if path.is_absolute() {
+                            Ok(path)
+                        } else {
+                            dunce::canonicalize(path)
+                        }
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?;
 
-                let data_object: IDataObject = get_file_data_object(&paths).unwrap();
+                let data_object: IDataObject = get_file_data_object(&paths)?;
                 let drop_source: IDropSource = DropSource::new().into();
 
                 unsafe {
@@ -266,17 +275,11 @@ pub fn start_drag<W: HasWindowHandle, F: Fn(DragResult, CursorPosition) + Send +
                 }
             }
             DragItem::Data { .. } => {
-                init_ole();
-                unsafe {
-                    #[allow(static_mut_refs)]
-                    if let Err(e) = &OLE_RESULT {
-                        return Err(e.clone().into());
-                    }
-                }
+                let _ole = OleGuard::initialize()?;
 
                 let paths = vec![dunce::canonicalize("./")?];
 
-                let data_object: IDataObject = get_file_data_object(&paths).unwrap();
+                let data_object: IDataObject = get_file_data_object(&paths)?;
                 let drop_source: IDropSource = DummyDropSource::new().into();
 
                 unsafe {
@@ -365,26 +368,39 @@ pub fn create_instance<T: Interface + ComInterface>(clsid: &GUID) -> Result<T> {
     unsafe { CoCreateInstance(clsid, None, CLSCTX_ALL) }
 }
 
-fn get_file_data_object(paths: &[PathBuf]) -> Option<IDataObject> {
+fn get_file_data_object(paths: &[PathBuf]) -> Result<IDataObject> {
+    const DIRECT_HDROP_THRESHOLD: usize = 1_024;
+    if paths.len() >= DIRECT_HDROP_THRESHOLD {
+        return Ok(DataObject::new(paths.to_vec())?.into());
+    }
     unsafe {
-        let shell_item_array = get_shell_item_array(paths).unwrap();
-        shell_item_array.BindToHandler(None, &BHID_DataObject).ok()
+        let shell_item_array = get_shell_item_array(paths)?;
+        shell_item_array.BindToHandler(None, &BHID_DataObject)
     }
 }
 
-fn get_shell_item_array(paths: &[PathBuf]) -> Option<IShellItemArray> {
+fn get_shell_item_array(paths: &[PathBuf]) -> Result<IShellItemArray> {
     unsafe {
-        let list: Vec<*const Common::ITEMIDLIST> = paths
+        let owned: Vec<ItemIdList> = paths
             .iter()
-            .map(|path| get_file_item_id(path).cast_const())
+            .map(|path| get_file_item_id(path))
+            .collect::<Result<_>>()?;
+        let list: Vec<*const Common::ITEMIDLIST> = owned
+            .iter()
+            .map(|item| item.0.cast_const())
             .collect();
-        SHCreateShellItemArrayFromIDLists(&list).ok()
+        SHCreateShellItemArrayFromIDLists(&list)
     }
 }
 
-fn get_file_item_id(path: &Path) -> *mut Common::ITEMIDLIST {
+fn get_file_item_id(path: &Path) -> Result<ItemIdList> {
     unsafe {
         let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
-        windows::Win32::UI::Shell::ILCreateFromPathW(PCWSTR::from_raw(wide_path.as_ptr()))
+        let item = windows::Win32::UI::Shell::ILCreateFromPathW(PCWSTR::from_raw(wide_path.as_ptr()));
+        if item.is_null() {
+            Err(Error::from_win32())
+        } else {
+            Ok(ItemIdList(item))
+        }
     }
 }

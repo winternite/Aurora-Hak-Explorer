@@ -1,6 +1,6 @@
 [package]
 name = "aurora-hak-explorer"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2024"
 description = "A native, open-source HAK/ERF archive explorer for Neverwinter Nights"
 license = "GPL-3.0-or-later"

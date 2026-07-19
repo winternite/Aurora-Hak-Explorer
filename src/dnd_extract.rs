@@ -7,16 +7,17 @@
 //! while the ordinary URI-list target remains available to other desktops.
 
 use std::{
-    fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, RwLock},
 };
+
+use crate::archive::Entry;
 
 const OBJECT_PATH: &str = "/DndExtract/1";
 
 #[derive(Clone, Default)]
 struct ExtractService {
-    paths: Arc<RwLock<Vec<PathBuf>>>,
+    entries: Arc<RwLock<Vec<Entry>>>,
 }
 
 #[zbus::interface(name = "org.kde.ark.DndExtract")]
@@ -31,33 +32,32 @@ impl ExtractService {
             )));
         }
 
-        let paths = self
-            .paths
+        let entries = self
+            .entries
             .read()
             .map_err(|_| zbus::fdo::Error::Failed("The drag selection is unavailable".into()))?
             .clone();
-        if paths.is_empty() {
+        if entries.is_empty() {
             return Err(zbus::fdo::Error::Failed(
                 "The drag selection is empty".into(),
             ));
         }
 
-        for source in paths {
-            let filename = source.file_name().ok_or_else(|| {
-                zbus::fdo::Error::Failed(format!(
-                    "The staged resource has no filename: {}",
-                    source.display()
-                ))
-            })?;
-            let target = destination.join(filename);
-            fs::copy(&source, &target).map_err(|error| {
-                zbus::fdo::Error::Failed(format!(
-                    "Could not copy {} to {}: {error}",
-                    source.display(),
-                    target.display()
-                ))
-            })?;
-        }
+        let resources = entries
+            .into_iter()
+            .map(|entry| {
+                let filename = entry.safe_filename().map_err(|error| {
+                    zbus::fdo::Error::Failed(format!("The resource has no safe filename: {error}"))
+                })?;
+                Ok((entry, destination.join(filename)))
+            })
+            .collect::<zbus::fdo::Result<Vec<_>>>()?;
+        crate::archive::export_entries_parallel(&resources).map_err(|error| {
+            zbus::fdo::Error::Failed(format!(
+                "Could not extract the drag selection to {}: {error}",
+                destination.display()
+            ))
+        })?;
         Ok(())
     }
 }
@@ -65,7 +65,7 @@ impl ExtractService {
 pub struct Bridge {
     _connection: zbus::blocking::Connection,
     service: String,
-    paths: Arc<RwLock<Vec<PathBuf>>>,
+    entries: Arc<RwLock<Vec<Entry>>>,
 }
 
 impl Bridge {
@@ -77,7 +77,7 @@ impl Bridge {
             .ok_or_else(|| "The D-Bus session did not assign a unique service name".to_owned())?
             .to_string();
         let interface = ExtractService::default();
-        let paths = Arc::clone(&interface.paths);
+        let entries = Arc::clone(&interface.entries);
         connection
             .object_server()
             .at(OBJECT_PATH, interface)
@@ -85,13 +85,13 @@ impl Bridge {
         Ok(Self {
             _connection: connection,
             service,
-            paths,
+            entries,
         })
     }
 
-    pub fn set_paths(&self, paths: Vec<PathBuf>) {
-        if let Ok(mut current) = self.paths.write() {
-            *current = paths;
+    pub fn set_entries(&self, entries: Vec<Entry>) {
+        if let Ok(mut current) = self.entries.write() {
+            *current = entries;
         }
     }
 
@@ -107,6 +107,7 @@ impl Bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn kde_extract_request_copies_the_entire_offer() {
@@ -118,7 +119,14 @@ mod tests {
         fs::write(&second, b"texture").unwrap();
 
         let bridge = Bridge::new().unwrap();
-        bridge.set_paths(vec![first, second]);
+        let archive = crate::archive::Archive::new(
+            crate::archive::ArchiveKind::Hak,
+            crate::archive::ArchiveVersion::V1_0,
+        );
+        bridge.set_entries(vec![
+            archive.prepare_incoming_file(&first).unwrap(),
+            archive.prepare_incoming_file(&second).unwrap(),
+        ]);
         let caller = zbus::blocking::Connection::session().unwrap();
         let proxy = zbus::blocking::Proxy::new(
             &caller,

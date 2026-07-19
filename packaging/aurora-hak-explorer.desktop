@@ -7,5 +7,5 @@ Icon=aurora-hak-explorer
 Terminal=false
 Categories=Development;
 Keywords=Neverwinter;NWN;HAK;ERF;modding;
-MimeType=application/x-nwn-hak;application/x-nwn-erf;
+MimeType=application/x-nwn-hak;application/x-nwn-erf;application/x-nwn-bif;
 StartupNotify=true

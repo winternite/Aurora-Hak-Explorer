@@ -3,6 +3,7 @@
 mod archive;
 #[cfg(target_os = "linux")]
 mod dnd_extract;
+mod drag_cleanup;
 #[cfg(target_os = "linux")]
 mod drag_out;
 #[cfg(target_os = "windows")]
@@ -13,10 +14,10 @@ mod mdl;
 mod resource_types;
 mod single_instance;
 
-use archive::{Archive, ArchiveKind, ArchiveVersion};
+use archive::{Archive, ArchiveKind, ArchiveVersion, Entry};
 use eframe::egui::{self, Color32, RichText};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -34,10 +35,13 @@ const MAX_IMAGE_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_IMAGE_SIDE: u32 = 16_384;
 const MAX_TEXTURE_SIDE: u32 = 4096;
 const MAX_RECENT_ARCHIVES: usize = 8;
+const MAX_INTERNAL_DRAG_ORIGINS: usize = 16;
 const MAX_MODEL_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_MODEL_RENDER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_EXTRACTED_MODEL_STRINGS: usize = 2_000;
-const IMPORT_FILES_PER_FRAME: usize = 256;
+const IMPORT_MIN_FILES_PER_FRAME: usize = 256;
+const IMPORT_MAX_FILES_PER_FRAME: usize = 4096;
+const IMPORT_FRAME_BUDGET: Duration = Duration::from_millis(8);
 const MAX_DROPPED_DIRECTORY_FILES: usize = 1_000_000;
 const DISPLAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 type TextureDependencies = BTreeMap<String, Vec<archive::Entry>>;
@@ -45,6 +49,15 @@ type TextureDependencyResult = (PathBuf, TextureDependencies);
 
 fn main() -> eframe::Result {
     let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == drag_cleanup::HELPER_ARGUMENT)
+    {
+        if let Err(error) = drag_cleanup::run_helper() {
+            eprintln!("Drag cleanup helper failed: {error}");
+        }
+        return Ok(());
+    }
     if arguments
         .first()
         .is_some_and(|argument| argument == "--repack")
@@ -77,7 +90,7 @@ fn main() -> eframe::Result {
                     "OK\t{}\t{} resources\t{}",
                     path.display(),
                     archive.entries.len(),
-                    archive.version.label()
+                    archive.version_label()
                 ),
                 Err(error) => {
                     eprintln!("ERROR\t{}\t{error}", path.display());
@@ -92,7 +105,10 @@ fn main() -> eframe::Result {
     }
     let incoming_paths = match single_instance::route(&arguments) {
         single_instance::Launch::Forwarded => return Ok(()),
-        single_instance::Launch::Primary(receiver) => receiver,
+        single_instance::Launch::Primary(receiver) => {
+            drag_cleanup::recover_abandoned();
+            receiver
+        }
     };
     #[allow(unused_mut)]
     let viewport = egui::ViewportBuilder::default()
@@ -159,6 +175,7 @@ struct HakEditor {
     selection_anchor: Option<usize>,
     selection_cursor: Option<usize>,
     hovered_drop_files: Vec<String>,
+    hovered_drop_file_count: usize,
     pending_drop_files: Vec<PathBuf>,
     incoming_paths: Option<mpsc::Receiver<Vec<PathBuf>>>,
     internal_drag_origins: BTreeMap<PathBuf, InternalDragOrigin>,
@@ -180,6 +197,7 @@ struct HakEditor {
     compact_mode: bool,
     appearance: Appearance,
     recent_archives: Vec<PathBuf>,
+    nwn_installation: Option<PathBuf>,
     resource_middle_scroll_active: bool,
     image_preview: Option<ImagePreviewCache>,
     model_preview: Option<ModelPreviewCache>,
@@ -331,6 +349,7 @@ enum ClipboardCommand {
 
 struct AddConflict {
     path: PathBuf,
+    entry: Entry,
     existing_filename: String,
     replacement_index: usize,
 }
@@ -350,7 +369,7 @@ struct AddBatch {
     replaced: usize,
     skipped: usize,
     failures: Vec<String>,
-    entry_lookup: BTreeMap<(String, u16), usize>,
+    entry_lookup: HashMap<(String, u16), usize>,
 }
 
 struct ModelCompileJob {
@@ -482,6 +501,13 @@ impl HakEditor {
             .filter(|path| path.is_file() && is_archive_path(path))
             .take(MAX_RECENT_ARCHIVES)
             .collect();
+        let stored_nwn_installation = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<String>(storage, "nwn_installation"))
+            .map(PathBuf::from)
+            .and_then(|path| normalize_nwn_installation(&path));
+        let nwn_installation =
+            stored_nwn_installation.or_else(|| discover_nwn_installations(None).into_iter().next());
         cc.egui_ctx.set_theme(appearance.preference());
         Self {
             archive: None,
@@ -502,6 +528,7 @@ impl HakEditor {
             selection_anchor: None,
             selection_cursor: None,
             hovered_drop_files: Vec::new(),
+            hovered_drop_file_count: 0,
             pending_drop_files: Vec::new(),
             incoming_paths: None,
             internal_drag_origins: BTreeMap::new(),
@@ -523,6 +550,7 @@ impl HakEditor {
             compact_mode,
             appearance,
             recent_archives,
+            nwn_installation,
             resource_middle_scroll_active: false,
             image_preview: None,
             model_preview: None,
@@ -884,7 +912,7 @@ impl HakEditor {
                     .to_owned(),
                 count: archive.entries.len(),
                 bytes,
-                version: archive.version.label(),
+                version: archive.version_label(),
                 kind: String::from_utf8_lossy(archive.kind.signature())
                     .trim()
                     .to_owned(),
@@ -1349,7 +1377,7 @@ impl HakEditor {
     }
     fn open_dialog(&mut self) {
         if let Some(paths) = rfd::FileDialog::new()
-            .add_filter("NWN archives", &["hak", "erf", "mod", "sav"])
+            .add_filter("NWN archives", &["hak", "erf", "mod", "sav", "bif"])
             .pick_files()
         {
             for path in paths {
@@ -1361,6 +1389,10 @@ impl HakEditor {
         let Some(archive) = self.archive.as_mut() else {
             return;
         };
+        if !archive.kind.is_editable() {
+            self.status = "BIF archives are read-only; resources can still be extracted".into();
+            return;
+        }
         let path = if !save_as { archive.path.clone() } else { None }.or_else(|| {
             rfd::FileDialog::new()
                 .add_filter("NWN archive", &[archive.kind.extension()])
@@ -1410,6 +1442,14 @@ impl HakEditor {
     }
     fn add_paths(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() || self.archive.is_none() {
+            return;
+        }
+        if self
+            .archive
+            .as_ref()
+            .is_some_and(|archive| !archive.kind.is_editable())
+        {
+            self.status = "BIF archives are read-only; resources cannot be added".into();
             return;
         }
         let (paths, same_archive_skipped) = self.filter_same_archive_drag_paths(paths);
@@ -1463,6 +1503,7 @@ impl HakEditor {
                         archive,
                         &mut batch,
                         conflict.path,
+                        conflict.entry,
                         Some(conflict.replacement_index),
                     );
                 }
@@ -1472,6 +1513,7 @@ impl HakEditor {
                         archive,
                         &mut batch,
                         conflict.path,
+                        conflict.entry,
                         Some(conflict.replacement_index),
                     );
                 }
@@ -1487,34 +1529,50 @@ impl HakEditor {
             }
         }
 
+        let started = Instant::now();
         let mut processed = 0;
-        while !canceled && batch.conflict.is_none() && processed < IMPORT_FILES_PER_FRAME {
+        while !canceled
+            && batch.conflict.is_none()
+            && processed < IMPORT_MAX_FILES_PER_FRAME
+            && (processed < IMPORT_MIN_FILES_PER_FRAME || started.elapsed() < IMPORT_FRAME_BUDGET)
+        {
             let Some(path) = batch.queue.pop_front() else {
                 break;
             };
             processed += 1;
-            match archive.incoming_file_identity(&path) {
-                Ok(key) => match batch.entry_lookup.get(&key).copied() {
-                    Some(replacement_index) => match batch.policy {
-                        ConflictPolicy::Ask => {
-                            batch.conflict = Some(AddConflict {
-                                path,
-                                existing_filename: archive.entries[replacement_index].filename(),
-                                replacement_index,
-                            });
-                        }
-                        ConflictPolicy::ReplaceAll => {
-                            add_incoming(archive, &mut batch, path, Some(replacement_index));
-                        }
-                        ConflictPolicy::SkipAll => batch.skipped += 1,
-                    },
-                    None => {
-                        let new_index = archive.entries.len();
-                        if add_incoming(archive, &mut batch, path, None) {
-                            batch.entry_lookup.insert(key, new_index);
+            match archive.prepare_incoming_file(&path) {
+                Ok(entry) => {
+                    let key = Archive::incoming_entry_identity(&entry);
+                    match batch.entry_lookup.get(&key).copied() {
+                        Some(replacement_index) => match batch.policy {
+                            ConflictPolicy::Ask => {
+                                batch.conflict = Some(AddConflict {
+                                    path,
+                                    entry,
+                                    existing_filename: archive.entries[replacement_index]
+                                        .filename(),
+                                    replacement_index,
+                                });
+                            }
+                            ConflictPolicy::ReplaceAll => {
+                                add_incoming(
+                                    archive,
+                                    &mut batch,
+                                    path,
+                                    entry,
+                                    Some(replacement_index),
+                                );
+                            }
+                            ConflictPolicy::SkipAll => batch.skipped += 1,
+                        },
+                        None => {
+                            let new_index = archive.entries.len();
+                            if add_incoming(archive, &mut batch, path, entry, None) {
+                                batch.entry_lookup.insert(key, new_index);
+                            }
                         }
                     }
-                },
+                }
                 Err(error) => batch.failures.push(format!("{}: {error}", path.display())),
             }
         }
@@ -1594,8 +1652,16 @@ impl HakEditor {
         }
     }
     fn merge(&mut self) {
+        if self
+            .archive
+            .as_ref()
+            .is_some_and(|archive| !archive.kind.is_editable())
+        {
+            self.status = "BIF archives are read-only; they cannot be modified".into();
+            return;
+        }
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("NWN archives", &["hak", "erf", "mod", "sav"])
+            .add_filter("NWN archives", &["hak", "erf", "mod", "sav", "bif"])
             .pick_file()
         else {
             return;
@@ -1721,6 +1787,7 @@ impl HakEditor {
         let request = ModelCompileRequest {
             archive: archive.clone(),
             tabs: self.tabs.clone(),
+            nwn_installation: self.nwn_installation.clone(),
             model_indices,
             compiler,
             single_path,
@@ -1914,7 +1981,8 @@ impl HakEditor {
                 return;
             }
         };
-        let mut paths = Vec::with_capacity(self.selected.len());
+        drag_cleanup::register(directory.path(), drag_cleanup::UNCONFIRMED_DRAG_RETENTION);
+        let mut resources = Vec::with_capacity(self.selected.len());
         for index in self.selected.iter().copied() {
             let Some(entry) = archive.entries.get(index) else {
                 continue;
@@ -1927,31 +1995,37 @@ impl HakEditor {
                 }
             };
             let path = directory.path().join(filename);
-            if let Err(error) = archive.export_entry(index, &path) {
-                self.fail("Could not prepare resources for dragging", error);
-                return;
-            }
-            paths.push(path);
+            resources.push((entry.clone(), path));
         }
-        if paths.is_empty() {
+        if resources.is_empty() {
             return;
         }
-        let count = paths.len();
+        let count = resources.len();
+        #[cfg(target_os = "windows")]
+        if let Err(error) = archive::export_entries_parallel(&resources) {
+            self.fail("Could not prepare resources for dragging", error);
+            return;
+        }
+        let paths = resources
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>();
         self.internal_drag_origins.insert(
             directory.path().to_path_buf(),
             InternalDragOrigin { source_tab },
         );
+        prune_internal_drag_origins(&mut self.internal_drag_origins);
         drag_out::release_pointer_grab(frame);
         #[cfg(target_os = "linux")]
         {
             let archive_offer = self.dnd_extract.as_ref().map(|bridge| {
-                bridge.set_paths(paths.clone());
+                bridge.set_entries(resources.iter().map(|(entry, _)| entry.clone()).collect());
                 drag_out::ArchiveExtractOffer {
                     service: bridge.service().to_owned(),
                     path: bridge.path().to_owned(),
                 }
             });
-            drag_out::start(frame, paths, directory, archive_offer);
+            drag_out::start(frame, paths, resources, directory, archive_offer);
         }
         #[cfg(target_os = "windows")]
         drag_out::start(frame, paths, directory);
@@ -1967,6 +2041,10 @@ impl HakEditor {
         let Some(archive) = self.archive.as_ref() else {
             return;
         };
+        if cut && !archive.kind.is_editable() {
+            self.status = "BIF archives are read-only; use Copy instead of Cut".into();
+            return;
+        }
         if self.selected.is_empty() {
             return;
         }
@@ -1977,6 +2055,7 @@ impl HakEditor {
                 return;
             }
         };
+        drag_cleanup::register(directory.path(), Duration::ZERO);
         let mut paths = Vec::with_capacity(self.selected.len());
         for index in self.selected.iter().copied() {
             let Some(entry) = archive.entries.get(index) else {
@@ -2064,6 +2143,10 @@ impl HakEditor {
         let Some(archive) = self.archive.as_mut() else {
             return;
         };
+        if !archive.kind.is_editable() {
+            self.status = "BIF archives are read-only; resources cannot be removed".into();
+            return;
+        }
         if self.selected.is_empty() {
             return;
         }
@@ -2090,6 +2173,43 @@ impl HakEditor {
         self.load_tab(self.tabs.len() - 1);
         self.show_new = false;
         self.status = "Created a new unsaved archive".into();
+    }
+
+    fn choose_nwn_installation(&mut self) {
+        let mut dialog = rfd::FileDialog::new().set_title("Choose Neverwinter Nights installation");
+        if let Some(path) = self.nwn_installation.as_ref() {
+            dialog = dialog.set_directory(path);
+        }
+        let Some(path) = dialog.pick_folder() else {
+            return;
+        };
+        if let Some(path) = normalize_nwn_installation(&path) {
+            self.status = format!("Using Neverwinter Nights installation: {}", path.display());
+            self.nwn_installation = Some(path);
+            self.model_preview = None;
+        } else {
+            self.error = Some(format!(
+                "{} does not look like a Neverwinter Nights installation. Choose the folder containing the data directory and NWN .key files.",
+                path.display()
+            ));
+        }
+    }
+
+    fn auto_detect_nwn_installation(&mut self) {
+        let detected = discover_nwn_installations(None);
+        if let Some(path) = detected.into_iter().next() {
+            self.status = format!(
+                "Detected Neverwinter Nights installation: {}",
+                path.display()
+            );
+            self.nwn_installation = Some(path);
+            self.model_preview = None;
+        } else {
+            self.error = Some(
+                "No Neverwinter Nights installation was found in Steam, GOG, Beamdog, or the standard installation folders. You can choose it manually from Tools > NWN installation."
+                    .into(),
+            );
+        }
     }
     fn active_theme(&self, ctx: &egui::Context) -> egui::Theme {
         match self.appearance {
@@ -2126,6 +2246,7 @@ impl eframe::App for HakEditor {
             .map(|path| path.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         eframe::set_value(storage, "recent_archives", &recent_archives);
+        save_nwn_installation(storage, self.nwn_installation.as_deref());
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
@@ -2197,11 +2318,11 @@ impl eframe::App for HakEditor {
         if !forwarded.is_empty() {
             self.pending_drop_files.extend(forwarded);
         }
-        self.hovered_drop_files = ctx.input(|input| {
-            input
-                .raw
-                .hovered_files
+        let (hovered_drop_file_count, hovered_drop_files) = ctx.input(|input| {
+            let files = &input.raw.hovered_files;
+            let names = files
                 .iter()
+                .take(5)
                 .map(|file| {
                     file.path
                         .as_ref()
@@ -2210,17 +2331,21 @@ impl eframe::App for HakEditor {
                         .unwrap_or("file")
                         .to_owned()
                 })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
+                .collect();
+            (files.len(), names)
+        });
+        self.hovered_drop_file_count = hovered_drop_file_count;
+        self.hovered_drop_files = hovered_drop_files;
+        let mut dropped: Vec<PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
                 .collect()
         });
-        let dropped: Vec<PathBuf> = ctx
-            .input(|input| input.raw.dropped_files.clone())
-            .into_iter()
-            .filter_map(|file| file.path)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let mut seen = HashSet::with_capacity(dropped.len());
+        dropped.retain(|path| seen.insert(path.clone()));
         if !dropped.is_empty() {
             if let Some(position) = native_drag_local_position(ctx)
                 && let Some(index) = self
@@ -2246,6 +2371,10 @@ impl eframe::App for HakEditor {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let archive_editable = self
+            .archive
+            .as_ref()
+            .is_some_and(|archive| archive.kind.is_editable());
         if ctx.input(|input| input.viewport().close_requested()) && !self.force_quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if let Some(job) = self.model_compile_job.as_ref() {
@@ -2289,7 +2418,7 @@ impl eframe::App for HakEditor {
                 self.error = Some(directory_failures.join("\n"));
             }
         }
-        if !self.blocking_dialog_open() && !self.hovered_drop_files.is_empty() {
+        if !self.blocking_dialog_open() && self.hovered_drop_file_count > 0 {
             egui::Area::new(egui::Id::new("file_drop_overlay"))
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -2298,8 +2427,8 @@ impl eframe::App for HakEditor {
                         .inner_margin(32.0)
                         .show(ui, |ui| {
                             ui.heading("Drop files or folders to add to this archive");
-                            ui.label(format!("{} file(s) ready", self.hovered_drop_files.len()));
-                            for name in self.hovered_drop_files.iter().take(5) {
+                            ui.label(format!("{} file(s) ready", self.hovered_drop_file_count));
+                            for name in &self.hovered_drop_files {
                                 ui.label(name);
                             }
                         });
@@ -2323,14 +2452,14 @@ impl eframe::App for HakEditor {
                     ui.separator();
                     let enabled = self.archive.is_some();
                     if ui
-                        .add_enabled(enabled, egui::Button::new("Save   Ctrl+S"))
+                        .add_enabled(archive_editable, egui::Button::new("Save   Ctrl+S"))
                         .clicked()
                     {
                         self.save(false);
                         ui.close();
                     }
                     if ui
-                        .add_enabled(enabled, egui::Button::new("Save As…"))
+                        .add_enabled(archive_editable, egui::Button::new("Save As…"))
                         .clicked()
                     {
                         self.save(true);
@@ -2365,7 +2494,6 @@ impl eframe::App for HakEditor {
                 });
                 ui.menu_button("Edit", |ui| {
                     let has_selection = !self.selected.is_empty();
-                    let has_archive = self.archive.is_some();
                     if ui
                         .add_enabled(has_selection, egui::Button::new("Copy   Ctrl+C"))
                         .clicked()
@@ -2374,14 +2502,17 @@ impl eframe::App for HakEditor {
                         ui.close();
                     }
                     if ui
-                        .add_enabled(has_selection, egui::Button::new("Cut   Ctrl+X"))
+                        .add_enabled(
+                            has_selection && archive_editable,
+                            egui::Button::new("Cut   Ctrl+X"),
+                        )
                         .clicked()
                     {
                         request_cut = true;
                         ui.close();
                     }
                     if ui
-                        .add_enabled(has_archive, egui::Button::new("Paste   Ctrl+V"))
+                        .add_enabled(archive_editable, egui::Button::new("Paste   Ctrl+V"))
                         .clicked()
                     {
                         request_paste = true;
@@ -2399,28 +2530,28 @@ impl eframe::App for HakEditor {
                     }
                     ui.separator();
                     if ui
-                        .add_enabled(enabled, egui::Button::new("Add files…"))
+                        .add_enabled(archive_editable, egui::Button::new("Add files…"))
                         .clicked()
                     {
                         self.add_files();
                         ui.close();
                     }
                     if ui
-                        .add_enabled(enabled, egui::Button::new("Add directory…"))
+                        .add_enabled(archive_editable, egui::Button::new("Add directory…"))
                         .clicked()
                     {
                         self.add_directory();
                         ui.close();
                     }
                     if ui
-                        .add_enabled(enabled, egui::Button::new("Merge archive…"))
+                        .add_enabled(archive_editable, egui::Button::new("Merge archive…"))
                         .clicked()
                     {
                         self.merge();
                         ui.close();
                     }
                     if ui
-                        .add_enabled(enabled, egui::Button::new("Edit description…"))
+                        .add_enabled(archive_editable, egui::Button::new("Edit description…"))
                         .clicked()
                     {
                         self.description_buffer = self.archive.as_ref().unwrap().description();
@@ -2462,6 +2593,37 @@ impl eframe::App for HakEditor {
                         ui.close();
                     }
                 });
+                ui.menu_button("Tools", |ui| {
+                    ui.label("Neverwinter Nights installation");
+                    if let Some(path) = self.nwn_installation.as_ref() {
+                        let display = path.display().to_string();
+                        ui.label(RichText::new(&display).small().weak())
+                            .on_hover_text(display);
+                    } else {
+                        ui.label(RichText::new("Not configured").small().weak());
+                    }
+                    ui.separator();
+                    if ui.button("Choose installation directory…").clicked() {
+                        self.choose_nwn_installation();
+                        ui.close();
+                    }
+                    if ui.button("Auto-detect installation").clicked() {
+                        self.auto_detect_nwn_installation();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.nwn_installation.is_some(),
+                            egui::Button::new("Clear configured directory"),
+                        )
+                        .clicked()
+                    {
+                        self.nwn_installation = None;
+                        self.model_preview = None;
+                        self.status = "Cleared the configured NWN installation directory".into();
+                        ui.close();
+                    }
+                });
                 ui.menu_button("Help", |ui| {
                     if ui.button("About Aurora Hak Explorer").clicked() {
                         self.show_about = true;
@@ -2479,7 +2641,7 @@ impl eframe::App for HakEditor {
                 .then(|| input.pointer.hover_pos())
                 .flatten()
         });
-        let native_drag_position = (!self.hovered_drop_files.is_empty())
+        let native_drag_position = (self.hovered_drop_file_count > 0)
             .then(|| native_drag_local_position(&ctx))
             .flatten();
         self.tab_drop_rects.clear();
@@ -2980,7 +3142,13 @@ impl eframe::App for HakEditor {
                             if ui.button("Extract this resource to disk").clicked() {
                                 self.export_selected();
                             }
-                            if ui.button("Remove from archive").clicked() {
+                            if ui
+                                .add_enabled(
+                                    archive_editable,
+                                    egui::Button::new("Remove from archive"),
+                                )
+                                .clicked()
+                            {
                                 self.delete_selected();
                             }
                         });
@@ -3330,7 +3498,14 @@ impl eframe::App for HakEditor {
                                             request_model_export = model_export_action;
                                             ui.close();
                                         }
-                                        if ui.button(format!("Delete selected ({count})")).clicked()
+                                        if ui
+                                            .add_enabled(
+                                                archive_editable,
+                                                egui::Button::new(format!(
+                                                    "Delete selected ({count})"
+                                                )),
+                                            )
+                                            .clicked()
                                         {
                                             request_delete = true;
                                             ui.close();
@@ -3389,11 +3564,17 @@ impl eframe::App for HakEditor {
                     if ui.button("Extract All…").clicked() {
                         self.extract_all();
                     }
-                    if ui.button("Add…").clicked() {
+                    if ui
+                        .add_enabled(archive_editable, egui::Button::new("Add…"))
+                        .clicked()
+                    {
                         self.add_files();
                     }
                     if ui
-                        .add_enabled(!self.selected.is_empty(), egui::Button::new("Delete"))
+                        .add_enabled(
+                            archive_editable && !self.selected.is_empty(),
+                            egui::Button::new("Delete"),
+                        )
                         .clicked()
                     {
                         self.delete_selected();
@@ -3433,7 +3614,9 @@ impl eframe::App for HakEditor {
                                 self.show_new = true;
                             }
                             ui.add_space(10.0);
-                            ui.label("You can also drop a .hak, .erf, .mod, or .sav file here.");
+                            ui.label(
+                                "You can also drop a .hak, .erf, .mod, .sav, or .bif file here.",
+                            );
                             if !self.recent_archives.is_empty() {
                                 ui.add_space(24.0);
                                 ui.label(RichText::new("Recently opened").size(16.0).strong());
@@ -3946,7 +4129,7 @@ struct ModelDependencyResolver<'a> {
 }
 
 impl<'a> ModelDependencyResolver<'a> {
-    fn new(active: &'a Archive, tabs: &'a [TabState]) -> Self {
+    fn new(active: &'a Archive, tabs: &'a [TabState], nwn_installation: Option<&Path>) -> Self {
         let mut archives = vec![(active, "the current archive".to_owned())];
         for tab in tabs {
             if tab.archive.view_key().0 == active.view_key().0 {
@@ -4018,7 +4201,7 @@ impl<'a> ModelDependencyResolver<'a> {
         loose_directories.sort();
         loose_directories.dedup();
 
-        let install_roots = discover_nwn_installations();
+        let install_roots = discover_nwn_installations(nwn_installation);
         let game_resources = game_resources::GameResourceIndex::build(&install_roots, 0x07d2);
         Self {
             archives,
@@ -4124,30 +4307,139 @@ fn home_directory() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn discover_nwn_installations() -> Vec<PathBuf> {
-    let mut roots = std::env::var_os("AHE_NWN_INSTALL")
-        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .unwrap_or_default();
+fn save_nwn_installation(storage: &mut dyn eframe::Storage, path: Option<&Path>) {
+    if let Some(path) = path {
+        eframe::set_value(
+            storage,
+            "nwn_installation",
+            &path.to_string_lossy().into_owned(),
+        );
+    } else {
+        storage.remove_string("nwn_installation");
+    }
+}
+
+fn discover_nwn_installations(preferred: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = preferred
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    candidates.extend(
+        std::env::var_os("AHE_NWN_INSTALL")
+            .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    let mut steam_roots = Vec::new();
     if let Some(home) = home_directory() {
-        roots.extend([
-            home.join(".steam/steam/steamapps/common/Neverwinter Nights"),
-            home.join(".local/share/Steam/steamapps/common/Neverwinter Nights"),
-            home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/Neverwinter Nights"),
+        steam_roots.extend([
+            home.join(".steam/steam"),
+            home.join(".local/share/Steam"),
+            home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"),
+        ]);
+        candidates.extend([
+            home.join(".beamdog/00829"),
+            home.join("GOG Games/Neverwinter Nights Enhanced Edition"),
         ]);
     }
     for variable in ["PROGRAMFILES(X86)", "PROGRAMFILES"] {
         if let Some(directory) = std::env::var_os(variable) {
-            roots.push(PathBuf::from(directory).join("Steam/steamapps/common/Neverwinter Nights"));
+            let directory = PathBuf::from(directory);
+            steam_roots.push(directory.join("Steam"));
+            candidates.extend([
+                directory.join("GOG Galaxy/Games/Neverwinter Nights Enhanced Edition"),
+                directory.join("Beamdog/Neverwinter Nights"),
+            ]);
         }
     }
-    roots.retain(|path| path.is_dir());
-    roots = roots
-        .into_iter()
-        .map(|path| fs::canonicalize(&path).unwrap_or(path))
-        .collect();
-    roots.sort();
-    roots.dedup();
+    let mut steam_libraries = steam_roots.clone();
+    for root in steam_roots {
+        for vdf in [
+            root.join("steamapps/libraryfolders.vdf"),
+            root.join("config/libraryfolders.vdf"),
+        ] {
+            steam_libraries.extend(steam_library_paths(&vdf));
+        }
+    }
+    for library in steam_libraries {
+        let steamapps = if library
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("steamapps"))
+        {
+            library
+        } else {
+            library.join("steamapps")
+        };
+        let manifest = steamapps.join("appmanifest_704450.acf");
+        let install_name =
+            steam_install_directory(&manifest).unwrap_or_else(|| "Neverwinter Nights".to_owned());
+        candidates.push(steamapps.join("common").join(install_name));
+    }
+
+    let mut roots = Vec::new();
+    for candidate in candidates {
+        if let Some(root) = normalize_nwn_installation(&candidate)
+            && !roots.contains(&root)
+        {
+            roots.push(root);
+        }
+    }
     roots
+}
+
+fn normalize_nwn_installation(path: &Path) -> Option<PathBuf> {
+    if !path.is_dir() {
+        return None;
+    }
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if directory_has_key_file(&path) {
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("data"))
+            && let Some(parent) = path.parent()
+        {
+            return Some(parent.to_path_buf());
+        }
+        return Some(path);
+    }
+    directory_has_key_file(&path.join("data")).then_some(path)
+}
+
+fn directory_has_key_file(path: &Path) -> bool {
+    fs::read_dir(path).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            entry.path().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("key"))
+        })
+    })
+}
+
+fn steam_library_paths(path: &Path) -> Vec<PathBuf> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| quoted_vdf_value(line, "path"))
+        .map(|value| PathBuf::from(value.replace("\\\\", "\\")))
+        .collect()
+}
+
+fn steam_install_directory(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    text.lines()
+        .find_map(|line| quoted_vdf_value(line, "installdir"))
+}
+
+fn quoted_vdf_value(line: &str, wanted_key: &str) -> Option<String> {
+    let mut quoted = line.split('"');
+    let _before = quoted.next()?;
+    let key = quoted.next()?;
+    let _between = quoted.next()?;
+    let value = quoted.next()?;
+    key.eq_ignore_ascii_case(wanted_key)
+        .then(|| value.to_owned())
 }
 
 fn stage_model_dependencies(
@@ -4231,6 +4523,7 @@ fn bundled_model_compiler() -> Result<ModelCompiler, String> {
         .prefix("ahe-model-compiler-")
         .tempdir()
         .map_err(|error| format!("could not prepare the embedded model compiler: {error}"))?;
+    drag_cleanup::register(directory.path(), Duration::ZERO);
     let path = directory.path().join("nwnmdlcomp.exe");
     fs::write(&path, COMPILER)
         .map_err(|error| format!("could not extract the embedded model compiler: {error}"))?;
@@ -4277,6 +4570,7 @@ fn bundled_model_compiler() -> Result<ModelCompiler, String> {
 struct ModelCompileRequest {
     archive: Archive,
     tabs: Vec<TabState>,
+    nwn_installation: Option<PathBuf>,
     model_indices: Vec<usize>,
     compiler: PathBuf,
     single_path: Option<PathBuf>,
@@ -4323,7 +4617,12 @@ fn compile_models_worker(
             return;
         }
     };
-    let mut resolver = ModelDependencyResolver::new(&request.archive, &request.tabs);
+    drag_cleanup::register(workspace.path(), Duration::ZERO);
+    let mut resolver = ModelDependencyResolver::new(
+        &request.archive,
+        &request.tabs,
+        request.nwn_installation.as_deref(),
+    );
     let mut staged_dependencies = BTreeSet::new();
     let mut failure_report = None;
     let mut batch = Vec::with_capacity(BATCH_SIZE);
@@ -4657,9 +4956,10 @@ fn add_incoming(
     archive: &mut Archive,
     batch: &mut AddBatch,
     path: PathBuf,
+    entry: Entry,
     replacement_index: Option<usize>,
 ) -> bool {
-    match archive.add_file_unsorted(&path, replacement_index) {
+    match archive.add_prepared_entry_unsorted(entry, replacement_index) {
         Ok(true) => {
             batch.replaced += 1;
             true
@@ -4884,13 +5184,20 @@ fn is_archive_path(path: &std::path::Path) -> bool {
         .is_some_and(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "hak" | "erf" | "mod" | "sav"
+                "hak" | "erf" | "mod" | "sav" | "bif"
             )
         })
 }
 
 fn internal_drag_returns_to_source(origin: &InternalDragOrigin, target_tab: Option<usize>) -> bool {
     target_tab == Some(origin.source_tab)
+}
+
+fn prune_internal_drag_origins(origins: &mut BTreeMap<PathBuf, InternalDragOrigin>) {
+    origins.retain(|directory, _| directory.is_dir());
+    while origins.len() > MAX_INTERNAL_DRAG_ORIGINS {
+        origins.pop_first();
+    }
 }
 
 fn category_for(extension: &str) -> &'static str {
@@ -5979,6 +6286,25 @@ fn split_2da_line(line: &str) -> Vec<String> {
 mod clipboard_tests {
     use super::*;
 
+    #[derive(Default)]
+    struct TestStorage(BTreeMap<String, String>);
+
+    impl eframe::Storage for TestStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+
+        fn remove_string(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+
+        fn flush(&mut self) {}
+    }
+
     #[test]
     fn compilation_times_are_formatted_readably() {
         assert_eq!(format_compilation_duration(Duration::from_secs(5)), "5s");
@@ -6017,6 +6343,49 @@ mod clipboard_tests {
     }
 
     #[test]
+    fn recognizes_bif_archive_extensions() {
+        assert!(is_archive_path(Path::new("aurora_tds.bif")));
+        assert!(!is_archive_path(Path::new("not_an_archive.bifx")));
+    }
+
+    #[test]
+    fn recognizes_nwn_installation_roots_and_their_data_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("Neverwinter Nights");
+        let data = root.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("nwn_base.key"), b"KEY V1  ").unwrap();
+        let expected = fs::canonicalize(&root).unwrap();
+        assert_eq!(normalize_nwn_installation(&root), Some(expected.clone()));
+        assert_eq!(normalize_nwn_installation(&data), Some(expected));
+    }
+
+    #[test]
+    fn reads_steam_library_and_nwn_manifest_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let libraries = directory.path().join("libraryfolders.vdf");
+        fs::write(
+            &libraries,
+            "\"libraryfolders\"\n{\n \"1\" { \n  \"path\" \"D:\\\\SteamLibrary\"\n }\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            steam_library_paths(&libraries),
+            vec![PathBuf::from(r"D:\SteamLibrary")]
+        );
+        let manifest = directory.path().join("appmanifest_704450.acf");
+        fs::write(
+            &manifest,
+            "\"AppState\"\n{\n \"appid\" \"704450\"\n \"installdir\" \"Neverwinter Nights\"\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            steam_install_directory(&manifest).as_deref(),
+            Some("Neverwinter Nights")
+        );
+    }
+
+    #[test]
     fn resolves_diffuse_texture_from_enhanced_edition_material() {
         let material = b"// material\nrenderhint NormalAndSpecMapped\ntexture0 mehrunes\ntexture1 mehrunes_n\n";
         assert_eq!(mtr_diffuse_texture(material).as_deref(), Some("mehrunes"));
@@ -6029,6 +6398,43 @@ mod clipboard_tests {
         assert!(internal_drag_returns_to_source(&origin, Some(3)));
         assert!(!internal_drag_returns_to_source(&origin, Some(2)));
         assert!(!internal_drag_returns_to_source(&origin, None));
+    }
+
+    #[test]
+    fn internal_drag_origin_bookkeeping_is_bounded_and_prunes_expired_paths() {
+        let directories = (0..MAX_INTERNAL_DRAG_ORIGINS + 4)
+            .map(|_| tempfile::tempdir().unwrap())
+            .collect::<Vec<_>>();
+        let mut origins = directories
+            .iter()
+            .enumerate()
+            .map(|(source_tab, directory)| {
+                (
+                    directory.path().to_path_buf(),
+                    InternalDragOrigin { source_tab },
+                )
+            })
+            .collect();
+        prune_internal_drag_origins(&mut origins);
+        assert_eq!(origins.len(), MAX_INTERNAL_DRAG_ORIGINS);
+
+        let expired = origins.keys().next().unwrap().clone();
+        fs::remove_dir_all(expired).unwrap();
+        prune_internal_drag_origins(&mut origins);
+        assert_eq!(origins.len(), MAX_INTERNAL_DRAG_ORIGINS - 1);
+    }
+
+    #[test]
+    fn clearing_nwn_installation_removes_the_persisted_path() {
+        let mut storage = TestStorage::default();
+        let path = Path::new("/games/Neverwinter Nights");
+        save_nwn_installation(&mut storage, Some(path));
+        assert_eq!(
+            eframe::get_value::<String>(&storage, "nwn_installation").as_deref(),
+            Some("/games/Neverwinter Nights")
+        );
+        save_nwn_installation(&mut storage, None);
+        assert!(!storage.0.contains_key("nwn_installation"));
     }
 
     #[test]
@@ -6336,7 +6742,7 @@ mod clipboard_tests {
         dependencies.add_file(&dependency_path).unwrap();
         dependencies.add_file(&root_path).unwrap();
         let tabs = vec![TabState::new(dependencies, false)];
-        let mut resolver = ModelDependencyResolver::new(&active, &tabs);
+        let mut resolver = ModelDependencyResolver::new(&active, &tabs, None);
         let workspace = tempfile::tempdir().unwrap();
         let source = b"newmodel cloak\nsetsupermodel cloak pfg2\nbeginmodelgeom cloak\nendmodelgeom cloak\ndonemodel cloak\n";
         let origins = stage_model_dependencies(
@@ -6409,6 +6815,7 @@ mod clipboard_tests {
             ModelCompileRequest {
                 archive,
                 tabs: Vec::new(),
+                nwn_installation: None,
                 model_indices: (0..130).collect(),
                 compiler: compiler.path.clone(),
                 single_path: None,

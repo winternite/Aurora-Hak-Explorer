@@ -10,4 +10,8 @@
     <glob pattern="*.mod"/>
     <glob pattern="*.sav"/>
   </mime-type>
+  <mime-type type="application/x-nwn-bif">
+    <comment>BioWare BIFF archive</comment>
+    <glob pattern="*.bif"/>
+  </mime-type>
 </mime-info>

@@ -2,6 +2,24 @@
 
 All notable changes to Aurora Hak Explorer are recorded here.
 
+## 1.2.2 — 2026-07-19
+
+- Improve very large drag-and-drop operations: imports avoid duplicate file
+  metadata work and use adaptive UI batches, outgoing staging uses bounded
+  parallelism, Linux KDE drops extract lazily from the archive, and large
+  Windows drags avoid per-file Shell PIDL setup.
+- Ensure drag, clipboard, and model-workspace temporary directories are removed
+  after Aurora exits by handing their cleanup deadlines to a durable helper.
+- Remove completed drag staging directories after a fixed one-minute grace
+  period on both Linux and Windows.
+- Recover abandoned `ahe-drag-*` directories at startup after crashes or system
+  shutdowns, deleting those at least 15 minutes old immediately and scheduling
+  newer leftovers for their remaining safe-retention time.
+- Open BioWare BIFF V1 archives (`.bif`) for browsing, model and resource previews, drag/copy export, and extraction.
+- Match NWN Explorer's standalone-BIF naming convention (`resN.ext`) and keep BIF archives read-only to protect installed game data.
+- Automatically locate Steam, GOG, and Beamdog NWN installations, with a remembered manual installation-directory option under the Tools menu.
+- Bound and clean outgoing-drag staging on both platforms, release Windows Shell allocations correctly, persist installation-path clearing, and honor the manually selected NWN installation when duplicate game resources exist.
+
 ## 1.2.1 — 2026-07-19
 
 - Compile models in bounded batches with a shared workspace and dependency cache, greatly reducing helper-process and temporary-file overhead.

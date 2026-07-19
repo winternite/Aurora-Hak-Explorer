@@ -6,7 +6,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## Features
 
-- Open and validate ERF V1.0 and V1.1 containers
+- Open and validate ERF V1.0/V1.1 containers and read-only BIFF V1 archives
 - Create HAK, ERF, MOD, and SAV archives
 - Add individual resources or every supported file in a directory
 - Extract selected resources or an entire archive
@@ -23,6 +23,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 - Compile ASCII MDLs or decompile binary MDLs without launching Neverwinter Nights
 - Filter all, compiled, or uncompiled models directly from the Resource Tree
 - Reopen archives quickly from the remembered recent-files list
+- Automatically find Steam, GOG, and Beamdog NWN installations, or remember a manually selected installation directory
 - Remembered compact mode that hides the resource tree and details panes
 - Search and type-to-select, sortable columns, multi-selection, drag files in or out, and keyboard shortcuts
 - Export one or several selected resources from the right-click menu
@@ -44,7 +45,7 @@ The binary will be at `target/release/aurora-hak-explorer`.
 
 ## Format scope
 
-HAK, ERF, MOD, and SAV are variations of BioWare's ERF container. V1.0 uses 16-byte resource names and is used by NWN/NWN:EE. V1.1 uses 32-byte names and is used by NWN2. ERF V1.x uses 32-bit offsets, so an archive cannot exceed 4 GiB.
+HAK, ERF, MOD, and SAV are variations of BioWare's ERF container. V1.0 uses 16-byte resource names and is used by NWN/NWN:EE. V1.1 uses 32-byte names and is used by NWN2. ERF V1.x uses 32-bit offsets, so an archive cannot exceed 4 GiB. BioWare BIFF V1 (`.bif`) archives can be browsed, previewed, and extracted; because standalone BIF files contain no resource names, entries use NWN Explorer-compatible names such as `res107.mdl`. BIF archives are opened read-only.
 
 ## License
 
