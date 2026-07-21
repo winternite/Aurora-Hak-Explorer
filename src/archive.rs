@@ -625,10 +625,18 @@ impl Archive {
         })
     }
 
+    #[cfg(test)]
     pub fn merge(&mut self, other: &Archive) -> (usize, usize) {
+        self.merge_entries(&other.entries)
+    }
+
+    pub fn merge_entries<'a>(
+        &mut self,
+        incoming_entries: impl IntoIterator<Item = &'a Entry>,
+    ) -> (usize, usize) {
         let mut added = 0;
         let mut replaced = 0;
-        for incoming in &other.entries {
+        for incoming in incoming_entries {
             if let Some(index) = self.entries.iter().position(|e| {
                 e.name.eq_ignore_ascii_case(&incoming.name) && e.type_id == incoming.type_id
             }) {

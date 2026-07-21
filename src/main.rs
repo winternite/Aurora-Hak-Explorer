@@ -166,6 +166,7 @@ struct HakEditor {
     filter: String,
     status: String,
     error: Option<String>,
+    warning: Option<String>,
     dirty: bool,
     edit_history: EditHistory,
     show_about: bool,
@@ -203,7 +204,7 @@ struct HakEditor {
     appearance: Appearance,
     recent_archives: Vec<PathBuf>,
     nwn_installation: Option<PathBuf>,
-    resource_middle_scroll_active: bool,
+    resource_middle_scroll_anchor: Option<egui::Pos2>,
     image_preview: Option<ImagePreviewCache>,
     model_preview: Option<ModelPreviewCache>,
     model_view: ModelView,
@@ -373,6 +374,8 @@ struct AddBatch {
     added: usize,
     replaced: usize,
     skipped: usize,
+    unsupported_files: usize,
+    unsupported_extensions: BTreeSet<String>,
     failures: Vec<String>,
     entry_lookup: HashMap<(String, u16), usize>,
     changes: HashMap<(String, u16), ResourceChange>,
@@ -513,6 +516,8 @@ impl AddBatch {
             added: 0,
             replaced: 0,
             skipped: 0,
+            unsupported_files: 0,
+            unsupported_extensions: BTreeSet::new(),
             failures: Vec::new(),
             entry_lookup,
             changes: HashMap::new(),
@@ -610,6 +615,7 @@ impl HakEditor {
             filter: String::new(),
             status: "Ready — open an archive or create a new one".into(),
             error: None,
+            warning: None,
             dirty: false,
             edit_history: EditHistory::default(),
             show_about: false,
@@ -647,7 +653,7 @@ impl HakEditor {
             appearance,
             recent_archives,
             nwn_installation,
-            resource_middle_scroll_active: false,
+            resource_middle_scroll_anchor: None,
             image_preview: None,
             model_preview: None,
             model_view: ModelView::Model,
@@ -1269,6 +1275,7 @@ impl HakEditor {
             || self.show_description
             || self.show_about
             || self.error.is_some()
+            || self.warning.is_some()
     }
 
     fn selected_resource_keys(&self) -> BTreeSet<(String, u16)> {
@@ -1542,11 +1549,17 @@ impl HakEditor {
         match Archive::open(&path) {
             Ok(archive) => {
                 let count = archive.entries.len();
+                let unsupported = unsupported_archive_resource_summary(&archive);
                 self.sync_current_tab();
                 self.tabs.push(TabState::new(archive, false));
                 self.load_tab(self.tabs.len() - 1);
                 self.status = format!("Opened {} — {count} resources", path.display());
                 self.remember_recent_archive(&path);
+                if let Some(unsupported) = unsupported {
+                    self.warning = Some(format!(
+                        "This archive contains {unsupported} outside the NWN/NWN:EE import allowlist. They remain available to inspect and extract, but cannot be added to or merged into a new archive."
+                    ));
+                }
             }
             Err(e) => self.fail("Could not open archive", e),
         }
@@ -1635,17 +1648,49 @@ impl HakEditor {
             self.status = "BIF archives are read-only; resources cannot be added".into();
             return;
         }
-        let (paths, same_archive_skipped) = self.filter_same_archive_drag_paths(paths);
+        let (mut paths, same_archive_skipped) = self.filter_same_archive_drag_paths(paths);
+        let mut unsupported_extensions = BTreeSet::new();
+        let original_path_count = paths.len();
+        paths.retain(|path| {
+            let Some(extension) = unsupported_import_extension(path) else {
+                return true;
+            };
+            unsupported_extensions.insert(extension);
+            false
+        });
+        let unsupported_files = original_path_count - paths.len();
+        if unsupported_files > 0 {
+            self.error = Some(format!(
+                "Skipped {unsupported_files} file(s) that are not valid NWN/NWN:EE resources: {}",
+                unsupported_extensions
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         if paths.is_empty() {
-            self.status = format!(
-                "Skipped {same_archive_skipped} resource(s) already present in this archive"
-            );
+            self.status = if unsupported_extensions.is_empty() {
+                format!(
+                    "Skipped {same_archive_skipped} resource(s) already present in this archive"
+                )
+            } else {
+                format!(
+                    "Skipped {unsupported_files} unsupported resource(s) ({})",
+                    unsupported_extensions
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             return;
         }
         if let Some(batch) = self.pending_add.as_mut() {
             if self.active_tab == Some(batch.target_tab) {
                 batch.queue.extend(paths);
-                batch.skipped += same_archive_skipped;
+                batch.skipped += same_archive_skipped + unsupported_files;
+                batch.unsupported_files += unsupported_files;
+                batch.unsupported_extensions.extend(unsupported_extensions);
             } else {
                 self.pending_drop_files.extend(paths);
             }
@@ -1666,7 +1711,9 @@ impl HakEditor {
             self.dirty,
             self.category.clone(),
         );
-        batch.skipped = same_archive_skipped;
+        batch.skipped = same_archive_skipped + unsupported_files;
+        batch.unsupported_files = unsupported_files;
+        batch.unsupported_extensions = unsupported_extensions;
         self.pending_add = Some(batch);
         self.process_add_batch(ConflictAction::Continue);
     }
@@ -1808,6 +1855,18 @@ impl HakEditor {
                     batch.added, batch.replaced, batch.skipped
                 )
             };
+            if batch.unsupported_files > 0 {
+                self.status.push_str(&format!(
+                    " — {} unsupported ({})",
+                    batch.unsupported_files,
+                    batch
+                        .unsupported_extensions
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
             if !batch.failures.is_empty() {
                 self.error = Some(summarize_import_failures(&batch.failures));
             }
@@ -1866,11 +1925,17 @@ impl HakEditor {
                 let selected_keys = self.selected_resource_keys();
                 let dirty_before = self.dirty;
                 let category_before = self.category.clone();
+                let allowed_entries = other
+                    .entries
+                    .iter()
+                    .filter(|entry| resource_types::is_nwn_ee_type(entry.type_id))
+                    .collect::<Vec<_>>();
+                let unsupported_entries = other.entries.len() - allowed_entries.len();
                 let Some(current) = self.archive.as_mut() else {
                     return;
                 };
                 let mut changes = BTreeMap::new();
-                for incoming in &other.entries {
+                for incoming in &allowed_entries {
                     let key = (incoming.name.to_ascii_lowercase(), incoming.type_id);
                     let before = current
                         .entries
@@ -1882,15 +1947,15 @@ impl HakEditor {
                     changes
                         .entry(key.clone())
                         .and_modify(|change: &mut ResourceChange| {
-                            change.after = Some(incoming.clone());
+                            change.after = Some((*incoming).clone());
                         })
                         .or_insert(ResourceChange {
                             key,
                             before,
-                            after: Some(incoming.clone()),
+                            after: Some((*incoming).clone()),
                         });
                 }
-                let (added, replaced) = current.merge(&other);
+                let (added, replaced) = current.merge_entries(allowed_entries);
                 self.dirty |= added + replaced > 0;
                 if added + replaced > 0 {
                     self.image_preview = None;
@@ -1900,6 +1965,11 @@ impl HakEditor {
                     "Merged {}: {added} added, {replaced} replaced",
                     path.display()
                 );
+                if unsupported_entries > 0 {
+                    self.status.push_str(&format!(
+                        " — skipped {unsupported_entries} non-NWN/EE resource(s)"
+                    ));
+                }
                 if added + replaced > 0 {
                     let transaction = resource_transaction(
                         format!("merge of {} resource(s)", added + replaced),
@@ -3895,32 +3965,63 @@ impl eframe::App for HakEditor {
                             });
                     },
                 );
-                let (middle_pressed, middle_down, pointer_position, pointer_delta) =
+                let (middle_pressed, primary_pressed, escape_pressed, pointer_position, delta_time) =
                     ctx.input(|input| {
                         (
                             input.pointer.button_pressed(egui::PointerButton::Middle),
-                            input.pointer.middle_down(),
+                            input.pointer.button_pressed(egui::PointerButton::Primary),
+                            input.key_pressed(egui::Key::Escape),
                             input.pointer.hover_pos(),
-                            input.pointer.delta(),
+                            input.stable_dt.min(0.05),
                         )
                     });
-                if middle_pressed
-                    && pointer_position
-                        .is_some_and(|position| resource_scroll.inner_rect.contains(position))
-                {
-                    self.resource_middle_scroll_active = true;
-                }
-                if self.resource_middle_scroll_active && middle_down {
-                    let mut state = resource_scroll.state;
-                    let maximum_offset = (resource_scroll.content_size.y
-                        - resource_scroll.inner_rect.height())
-                    .max(0.0);
-                    state.offset.y = (state.offset.y + pointer_delta.y).clamp(0.0, maximum_offset);
-                    state.store(&ctx, resource_scroll.id);
-                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                    ctx.request_repaint();
-                } else if !middle_down {
-                    self.resource_middle_scroll_active = false;
+                if self.blocking_dialog_open() {
+                    // A modal must never leave browser-style autoscroll running
+                    // behind it, even if the middle mouse button remains held.
+                    self.resource_middle_scroll_anchor = None;
+                } else {
+                    if self.resource_middle_scroll_anchor.is_some()
+                        && (middle_pressed || primary_pressed || escape_pressed)
+                    {
+                        self.resource_middle_scroll_anchor = None;
+                    } else if middle_pressed
+                        && pointer_position
+                            .is_some_and(|position| resource_scroll.inner_rect.contains(position))
+                    {
+                        self.resource_middle_scroll_anchor = pointer_position;
+                    }
+                    if let (Some(anchor), Some(position)) =
+                        (self.resource_middle_scroll_anchor, pointer_position)
+                    {
+                        let distance = position.y - anchor.y;
+                        // Match browser autoscroll: retain fine control close to the anchor,
+                        // then accelerate sharply enough to traverse very large archives.
+                        let speed = distance.signum()
+                            * ((distance.abs() - 6.0).max(0.0).powf(1.55) * 1.3).min(6_000.0);
+                        let mut state = resource_scroll.state;
+                        let maximum_offset = (resource_scroll.content_size.y
+                            - resource_scroll.inner_rect.height())
+                        .max(0.0);
+                        state.offset.y =
+                            (state.offset.y + speed * delta_time).clamp(0.0, maximum_offset);
+                        state.store(&ctx, resource_scroll.id);
+                        let painter = ui.painter();
+                        painter.circle_stroke(
+                            anchor,
+                            7.0,
+                            egui::Stroke::new(1.0, ui.visuals().text_color()),
+                        );
+                        painter.line_segment(
+                            [anchor - egui::vec2(10.0, 0.0), anchor + egui::vec2(10.0, 0.0)],
+                            egui::Stroke::new(1.0, ui.visuals().text_color()),
+                        );
+                        painter.line_segment(
+                            [anchor - egui::vec2(0.0, 10.0), anchor + egui::vec2(0.0, 10.0)],
+                            egui::Stroke::new(1.0, ui.visuals().text_color()),
+                        );
+                        ctx.set_cursor_icon(egui::CursorIcon::AllScroll);
+                        ctx.request_repaint();
+                    }
                 }
                 if request_drag.is_some() {
                     self.drag_selected(frame);
@@ -4440,6 +4541,42 @@ impl eframe::App for HakEditor {
                 });
             if cancel {
                 job.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        if let Some(message) = self.warning.clone() {
+            let mut close = false;
+            let theme = self.active_theme(&ctx);
+            let modal = egui::Modal::new(egui::Id::new("archive_compatibility_warning_modal"))
+                .frame(egui::Frame::popup(&ctx.style_of(theme)).inner_margin(24.0))
+                .show(&ctx, |ui| {
+                    ui.set_min_width(500.0);
+                    ui.set_max_width(650.0);
+                    ui.spacing_mut().item_spacing.y = 14.0;
+                    ui.label(
+                        RichText::new("Compatibility warning")
+                            .size(22.0)
+                            .strong()
+                            .color(Color32::from_rgb(255, 205, 110)),
+                    );
+                    ui.separator();
+                    ui.label(
+                        RichText::new(message)
+                            .size(17.0)
+                            .color(Color32::from_rgb(255, 220, 150)),
+                    );
+                    ui.add_space(6.0);
+                    if ui
+                        .add_sized(
+                            [120.0, 38.0],
+                            egui::Button::new(RichText::new("Continue").size(16.0)),
+                        )
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            if modal.should_close() || close {
+                self.warning = None;
             }
         }
         if let Some(message) = self.error.clone() {
@@ -5790,7 +5927,7 @@ fn category_for(extension: &str) -> &'static str {
         "nss" | "ncs" => "Scripts",
         "mdl" | "mtr" | "wok" | "pwk" | "dwk" => "Models",
         "tga" | "dds" | "plt" | "txi" | "bmp" | "jpg" | "png" | "ktx" => "Textures",
-        "wav" | "mp3" | "ogg" | "bmu" => "Music",
+        "wav" | "bmu" => "Music",
         "are" | "git" | "gic" => "Areas",
         "utc" | "bic" => "Creatures",
         "uti" | "utp" | "utd" | "utw" | "utt" | "uts" | "ute" | "utm" | "utg" => "Blueprints",
@@ -5800,6 +5937,39 @@ fn category_for(extension: &str) -> &'static str {
         "ifo" | "jrl" | "fac" | "itp" => "Module Data",
         _ => "Other",
     }
+}
+
+fn unsupported_import_extension(path: &Path) -> Option<String> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase());
+    match extension {
+        Some(extension) if resource_types::is_nwn_ee_extension(&extension) => None,
+        Some(extension) => Some(format!(".{extension}")),
+        None => Some("(no extension)".to_owned()),
+    }
+}
+
+fn unsupported_archive_resource_summary(archive: &Archive) -> Option<String> {
+    let mut types = BTreeMap::<String, usize>::new();
+    for entry in &archive.entries {
+        if !resource_types::is_nwn_ee_type(entry.type_id) {
+            *types.entry(format!(".{}", entry.extension())).or_default() += 1;
+        }
+    }
+    let total = types.values().sum::<usize>();
+    (total > 0).then(|| {
+        let mut labels = types
+            .iter()
+            .take(6)
+            .map(|(extension, count)| format!("{extension} ({count})"))
+            .collect::<Vec<_>>();
+        if types.len() > labels.len() {
+            labels.push(format!("and {} more type(s)", types.len() - labels.len()));
+        }
+        format!("{total} unsupported resource(s): {}", labels.join(", "))
+    })
 }
 
 fn tileset_unlocalized_name(bytes: &[u8]) -> Option<String> {
@@ -7143,6 +7313,8 @@ mod clipboard_tests {
         assert_eq!(category_for("plt"), "Textures");
         assert_eq!(category_for("set"), "Tileset");
         assert_eq!(category_for("bmu"), "Music");
+        assert_eq!(category_for("mp3"), "Other");
+        assert_eq!(category_for("ogg"), "Other");
         assert_eq!(
             tileset_unlocalized_name(b"[GENERAL]\nUnlocalizedName=DDIWD: Frozen Interiors\n"),
             Some("DDIWD: Frozen Interiors".into())
@@ -7153,6 +7325,37 @@ mod clipboard_tests {
         assert!(is_text_type("ids"));
         assert!(is_text_type("shd"));
         assert!(is_text_type("jui"));
+    }
+
+    #[test]
+    fn accepts_only_nwn_ee_resource_types_for_import() {
+        for extension in ["mp3", "ogg", "pdf", "zip", "fbx", "obj", "md"] {
+            assert_eq!(
+                unsupported_import_extension(Path::new(&format!("resource.{extension}"))),
+                Some(format!(".{extension}"))
+            );
+        }
+        for extension in ["png", "jpg", "mdl", "bmu", "wav", "utc", "jui"] {
+            assert_eq!(
+                unsupported_import_extension(Path::new(&format!("resource.{extension}"))),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn reports_unsupported_types_in_existing_archives_without_rejecting_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let zip = directory.path().join("legacy.zip");
+        fs::write(&zip, b"legacy resource").unwrap();
+        let mut archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        archive.add_file(&zip).unwrap();
+
+        assert_eq!(
+            unsupported_archive_resource_summary(&archive),
+            Some("1 unsupported resource(s): .zip (1)".into())
+        );
+        assert_eq!(archive.entries.len(), 1);
     }
 
     #[test]

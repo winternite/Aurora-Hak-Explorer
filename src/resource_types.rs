@@ -140,11 +140,6 @@ pub fn extension_for(type_id: u16) -> String {
 
 pub fn type_for(extension: &str) -> Option<u16> {
     let ext = extension.trim_start_matches('.').to_ascii_lowercase();
-    // NWN:EE accepts ordinary MP3 audio under the BMU resource type. Store
-    // imported .mp3 files as type 8 so archives remain game-compatible.
-    if ext == "mp3" {
-        return Some(0x0008);
-    }
     if let Some(hex) = ext.strip_prefix("type_") {
         return u16::from_str_radix(hex, 16).ok();
     }
@@ -152,6 +147,22 @@ pub fn type_for(extension: &str) -> Option<u16> {
         .iter()
         .find(|(_, known)| *known == ext)
         .map(|(id, _)| *id)
+}
+
+/// Whether an extension is an official Neverwinter Nights / Enhanced Edition
+/// resource type. Later table entries are kept for opening legacy or NWN2
+/// archives, but are deliberately not accepted for new NWN:EE HAK contents.
+pub fn is_nwn_ee_extension(extension: &str) -> bool {
+    let ext = extension.trim_start_matches('.').to_ascii_lowercase();
+    TYPES
+        .iter()
+        .any(|(id, known)| is_nwn_ee_type(*id) && *known == ext)
+}
+
+pub fn is_nwn_ee_type(type_id: u16) -> bool {
+    TYPES
+        .iter()
+        .any(|(known_id, _)| *known_id == type_id && type_id <= 0x0823)
 }
 
 #[cfg(test)]
@@ -162,11 +173,17 @@ mod tests {
     fn enhanced_edition_types_are_named() {
         assert_eq!(extension_for(0x0008), "bmu");
         assert_eq!(type_for("bmu"), Some(0x0008));
-        assert_eq!(type_for("mp3"), Some(0x0008));
+        assert_eq!(type_for("mp3"), None);
         assert_eq!(extension_for(0x0818), "mtr");
         assert_eq!(extension_for(0x0819), "ktx");
         assert_eq!(extension_for(0x0820), "png");
         assert_eq!(extension_for(0x0823), "jui");
         assert_eq!(type_for("png"), Some(0x0820));
+        assert!(is_nwn_ee_extension("png"));
+        assert!(is_nwn_ee_extension("bmu"));
+        assert!(!is_nwn_ee_extension("zip"));
+        assert!(!is_nwn_ee_extension("mp3"));
+        assert!(is_nwn_ee_type(0x0820));
+        assert!(!is_nwn_ee_type(0x0bc8));
     }
 }

@@ -2,6 +2,20 @@
 
 All notable changes to Aurora Hak Explorer are recorded here.
 
+## 1.2.5 — 2026-07-21
+
+- Replace the import blocklist with a strict NWN/NWN:EE resource-type
+  allowlist; arbitrary files and NWN2-only resource types cannot be added or
+  merged into an archive.
+- Show a clear error dialog naming unsupported file types skipped during file
+  picker, clipboard, drag-and-drop, or folder imports.
+- Warn when opening an existing archive that contains resource types outside
+  the NWN/NWN:EE allowlist, while keeping those entries fully browsable and
+  extractable.
+- Refine resource-list middle-click scrolling into browser-style autoscroll:
+  click to set an anchor, move farther to accelerate, and click again, left
+  click, press Escape, or open a modal dialog to stop.
+
 ## 1.2.4 — 2026-07-20
 
 - Add a Tileset category to the Resource Tree for NWN `.set` tileset
