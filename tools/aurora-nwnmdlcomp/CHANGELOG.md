@@ -2,6 +2,10 @@
 
 ## 0.1.1 - 2026-07-22
 
+- Qualified 113,161 CEP 3 models, added byte-exact preserved-source restores,
+  hardened malformed input handling, and documented six unsafe source rejects.
+- Preserved empty skin-weight rows and legacy constraint tables without
+  changing visible geometry; literal filenames with glob characters now work.
 - Corrected MDL texture, material, flare, emitter, supermodel, and reference
   name validation to use their actual compiled field widths instead of the
   unrelated 16-byte generic ResRef limit.

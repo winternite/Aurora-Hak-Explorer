@@ -1445,6 +1445,12 @@ fn face_row(face: &SemanticFace) -> Vec<String> {
 }
 
 fn weight_row(row: &[SemanticSkinWeight]) -> Vec<String> {
+    if row.is_empty() {
+        // Counted ASCII payloads cannot encode an empty physical row because
+        // blank lines are skipped. A zero-weight placeholder is semantically
+        // inert and preserves the vertex-to-weight-row alignment.
+        return vec!["null".to_string(), "0".to_string()];
+    }
     let mut values = Vec::new();
     for weight in row {
         values.push(weight.bone.clone());
@@ -1917,9 +1923,7 @@ impl<'a> Parser<'a> {
                 .next()
                 .ok_or_else(|| ModelError::msg("payload ended before expected row count"))?;
             if line.trim_start().starts_with('#') {
-                return Err(ModelError::msg(
-                    "comments inside counted payload blocks are not supported",
-                ));
+                continue;
             }
             rows.push(split_tokens(line.trim()));
         }

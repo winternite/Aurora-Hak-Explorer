@@ -34,11 +34,19 @@ Local verification performed for this project:
 - generated model, node, and mesh routine tables match shipped EE binaries;
 - all 10,588 ASCII models in `cep3_armor.hak` compiled and all generated
   binaries passed semantic validation, with no skipped models.
+- the complete local CEP 3 corpus was qualified: 17,362 of 17,368 ASCII
+  sources completed two conversion cycles, all 95,793 compiled models
+  decompiled, 95,764 completed a canonical round trip, and the 29 intentionally
+  non-canonical legacy binaries restored byte-for-byte in preserved-source
+  mode.
 
 Those checks are strong format-level coverage, but they are not a claim that
 every possible custom-content model has been rendered in every game build.
 Keep source models under version control and test release assets in the exact
 NWN:EE client build you ship against.
+
+See [QUALIFICATION.md](QUALIFICATION.md) for the corpus results and known
+malformed sources.
 
 ## Build
 

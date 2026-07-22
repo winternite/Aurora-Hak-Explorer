@@ -401,7 +401,11 @@ fn expand_inputs(arguments: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut inputs = Vec::new();
     for argument in arguments {
         let text = argument.to_string_lossy();
-        if text.contains(['*', '?', '[']) {
+        if argument.is_file() {
+            // Existing paths are always literal. This matters for legitimate
+            // model filenames containing glob metacharacters such as `[`.
+            inputs.push(argument.clone());
+        } else if text.contains(['*', '?', '[']) {
             let mut matched = false;
             for entry in glob(&text).with_context(|| format!("invalid input pattern {text:?}"))? {
                 let path = entry.with_context(|| format!("failed to expand pattern {text:?}"))?;
@@ -413,8 +417,6 @@ fn expand_inputs(arguments: &[PathBuf]) -> Result<Vec<PathBuf>> {
             if !matched {
                 bail!("input pattern {text:?} matched no files");
             }
-        } else if argument.is_file() {
-            inputs.push(argument.clone());
         } else {
             bail!("input file does not exist: {}", argument.display());
         }
@@ -471,7 +473,9 @@ fn finish_failures(failures: &[anyhow::Error]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::compiled_name;
+    use std::path::PathBuf;
+
+    use super::{compiled_name, expand_inputs};
 
     #[test]
     fn derives_non_destructive_output_names() {
@@ -479,5 +483,14 @@ mod tests {
         assert_eq!(compiled_name("foo.ascii.mdl"), "foo.mdl");
         assert_eq!(compiled_name("foo.mdl"), "foo.compiled.mdl");
         assert_eq!(compiled_name("foo"), "foo.mdl");
+    }
+
+    #[test]
+    fn existing_paths_with_glob_characters_are_literal() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("mesh[old].mdl");
+        std::fs::write(&path, b"model")?;
+        assert_eq!(expand_inputs(&[PathBuf::from(&path)])?, vec![path]);
+        Ok(())
     }
 }

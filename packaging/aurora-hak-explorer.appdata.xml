@@ -11,5 +11,5 @@
   <launchable type="desktop-id">aurora-hak-explorer.desktop</launchable>
   <provides><binary>aurora-hak-explorer</binary></provides>
   <content_rating type="oars-1.1"/>
-  <releases><release version="1.3.0" date="2026-07-22"/><release version="1.2.5" date="2026-07-21"/><release version="1.2.4" date="2026-07-20"/><release version="1.2.3" date="2026-07-20"/><release version="1.2.2" date="2026-07-19"/><release version="1.2.1" date="2026-07-19"/><release version="1.2.0" date="2026-07-19"/><release version="1.1.0" date="2026-07-19"/><release version="1.0.0" date="2026-07-17"/><release version="0.3.0" date="2026-07-16"/><release version="0.2.3" date="2026-07-16"/></releases>
+  <releases><release version="1.3.1" date="2026-07-22"/><release version="1.3.0" date="2026-07-22"/><release version="1.2.5" date="2026-07-21"/><release version="1.2.4" date="2026-07-20"/><release version="1.2.3" date="2026-07-20"/><release version="1.2.2" date="2026-07-19"/><release version="1.2.1" date="2026-07-19"/><release version="1.2.0" date="2026-07-19"/><release version="1.1.0" date="2026-07-19"/><release version="1.0.0" date="2026-07-17"/><release version="0.3.0" date="2026-07-16"/><release version="0.2.3" date="2026-07-16"/></releases>
 </component>

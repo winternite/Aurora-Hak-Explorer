@@ -2,6 +2,18 @@
 
 All notable changes to Aurora Hak Explorer are recorded here.
 
+## 1.3.1 — 2026-07-22
+
+- Update the bundled Aurora Rust MDL compiler with qualification across
+  113,161 CEP 3 model inputs, byte-exact preserved-source restoration, and
+  hardened malformed-input handling.
+- Preserve legacy empty skin-weight rows and constraint tables, accept literal
+  filenames containing glob characters, and improve compatibility with legacy
+  animation and model data.
+- Safely replace non-finite legacy binary-model values with zero while loading
+  data for preview, preventing unusable NaN or infinity values from escaping
+  into the renderer.
+
 ## 1.3.0 — 2026-07-22
 
 - Add the memory-safe Rust Aurora nwnmdlcomp compiler and decompiler on Linux

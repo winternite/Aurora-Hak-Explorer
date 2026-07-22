@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use nwnrs_types::mdl::{
     BinaryToAsciiOptions, ModelEncoding, compile_ascii_model, detect_model_encoding,
     lower_binary_model_to_ascii_with_options, parse_binary_model_bytes, read_ascii_model,
-    write_ascii_model, write_original_binary_model,
+    restore_compiled_model, write_ascii_model, write_original_binary_model,
 };
 
 /// Options controlling ASCII-to-binary compilation.
@@ -68,6 +68,9 @@ pub fn compile_bytes(source: &[u8], options: CompileOptions) -> Result<Vec<u8>> 
     };
 
     let ascii = read_ascii_model(&mut Cursor::new(input)).context("failed to parse ASCII MDL")?;
+    if let Ok(original) = restore_compiled_model(&ascii) {
+        return Ok(original.into_bytes());
+    }
     let binary = compile_ascii_model(&ascii).context("failed to compile semantic MDL")?;
     let mut output = Vec::new();
     write_original_binary_model(&mut output, &binary)
@@ -278,6 +281,7 @@ fn normalize_legacy_ascii(source: &[u8]) -> Result<Vec<u8>> {
     let mut cursor = 0;
     let mut remaining_face_rows = 0usize;
     let mut remaining_weight_rows = 0usize;
+    let mut remaining_constraint_rows = 0usize;
     while cursor < source.len() {
         let line_end = source[cursor..]
             .iter()
@@ -285,7 +289,15 @@ fn normalize_legacy_ascii(source: &[u8]) -> Result<Vec<u8>> {
             .map_or(source.len(), |offset| cursor + offset);
         let line = &source[cursor..line_end];
         let trimmed = trim_ascii(line);
-        if remaining_weight_rows > 0 && !trimmed.is_empty() && !trimmed.starts_with(b"#") {
+        if remaining_constraint_rows > 0 && trimmed.eq_ignore_ascii_case(b"endnode") {
+            write_missing_constraint_rows(&mut output, remaining_constraint_rows);
+            remaining_constraint_rows = 0;
+            output.extend_from_slice(line);
+        } else if remaining_constraint_rows > 0 && !trimmed.is_empty() && !trimmed.starts_with(b"#")
+        {
+            output.extend_from_slice(line);
+            remaining_constraint_rows -= 1;
+        } else if remaining_weight_rows > 0 && !trimmed.is_empty() && !trimmed.starts_with(b"#") {
             let tokens: Vec<_> = ascii_tokens(trimmed).collect();
             let stray_one = if tokens.len() % 2 == 1 {
                 (1..tokens.len().saturating_sub(1)).find(|&index| {
@@ -328,6 +340,10 @@ fn normalize_legacy_ascii(source: &[u8]) -> Result<Vec<u8>> {
             output.extend_from_slice(&line[..leading]);
             output.extend_from_slice(b"donemodel ");
             output.extend_from_slice(model_name);
+        } else if has_undefined_animation_scale(trimmed) {
+            let leading = line.len() - line.trim_ascii_start().len();
+            output.extend_from_slice(&line[..leading]);
+            output.extend_from_slice(b"setanimationscale 1.0");
         } else {
             output.extend_from_slice(line);
             if let Some(count) = face_row_count(trimmed) {
@@ -335,6 +351,9 @@ fn normalize_legacy_ascii(source: &[u8]) -> Result<Vec<u8>> {
             }
             if let Some(count) = weight_row_count(trimmed) {
                 remaining_weight_rows = count;
+            }
+            if let Some(count) = counted_statement_rows(trimmed, b"constraints") {
+                remaining_constraint_rows = count;
             }
         }
 
@@ -348,6 +367,19 @@ fn normalize_legacy_ascii(source: &[u8]) -> Result<Vec<u8>> {
     Ok(normalize_long_node_names(repair_legacy_node_structure(
         &output,
     )))
+}
+
+fn write_missing_constraint_rows(output: &mut Vec<u8>, count: usize) {
+    for _ in 0..count {
+        output.extend_from_slice(b"  0\n");
+    }
+}
+
+fn has_undefined_animation_scale(line: &[u8]) -> bool {
+    statement_starts_with(line, b"setanimationscale")
+        && ascii_tokens(line)
+            .nth(1)
+            .is_some_and(|value| value.eq_ignore_ascii_case(b"undefined"))
 }
 
 fn remove_legacy_control_bytes(source: &[u8]) -> Vec<u8> {
@@ -424,9 +456,13 @@ fn face_row_count(line: &[u8]) -> Option<usize> {
 }
 
 fn weight_row_count(line: &[u8]) -> Option<usize> {
+    counted_statement_rows(line, b"weights")
+}
+
+fn counted_statement_rows(line: &[u8], expected_keyword: &[u8]) -> Option<usize> {
     let mut tokens = ascii_tokens(line);
     let keyword = tokens.next()?;
-    if !keyword.eq_ignore_ascii_case(b"weights") {
+    if !keyword.eq_ignore_ascii_case(expected_keyword) {
         return None;
     }
     let count = std::str::from_utf8(tokens.next()?).ok()?.parse().ok()?;
@@ -568,6 +604,55 @@ donemodel
             },
         )?;
         assert!(String::from_utf8(ascii)?.contains("bitmap rivendelleliteswordfighter"));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_inputs_never_panic() -> anyhow::Result<()> {
+        let valid_binary = compile_bytes(
+            SIMPLE_MODEL.as_bytes(),
+            CompileOptions {
+                legacy_compatibility: true,
+            },
+        )?;
+        let seeds = [SIMPLE_MODEL.as_bytes(), valid_binary.as_slice()];
+
+        for seed in seeds {
+            for case in 0..512usize {
+                let mut mutated = seed.to_vec();
+                let index = case.wrapping_mul(2_654_435_761) % mutated.len();
+                mutated[index] ^= case.to_le_bytes()[0].wrapping_mul(73).wrapping_add(1);
+                if case % 4 == 0 {
+                    mutated.truncate(index);
+                }
+                let result = std::panic::catch_unwind(|| validate_bytes(&mutated));
+                assert!(result.is_ok(), "validation panicked for mutation {case}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn preserved_compiled_source_restores_byte_exactly() -> anyhow::Result<()> {
+        let binary = compile_bytes(
+            SIMPLE_MODEL.as_bytes(),
+            CompileOptions {
+                legacy_compatibility: true,
+            },
+        )?;
+        let ascii = decompile_bytes(
+            &binary,
+            DecompileOptions {
+                preserve_compiled_source: true,
+            },
+        )?;
+        let restored = compile_bytes(
+            &ascii,
+            CompileOptions {
+                legacy_compatibility: true,
+            },
+        )?;
+        assert_eq!(restored, binary);
         Ok(())
     }
 

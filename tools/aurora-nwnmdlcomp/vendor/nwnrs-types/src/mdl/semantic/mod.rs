@@ -1076,10 +1076,16 @@ pub(crate) fn ensure_ascii_representable(model: &SemanticModel) -> ModelResult<(
             .find(|node| !node.opaque_controllers.is_empty())
             .map(|node| (animation, node))
     }) {
+        let types = node
+            .opaque_controllers
+            .iter()
+            .map(|controller| controller.type_id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(ModelError::msg(format!(
             "animation {} node {} contains opaque compiled controllers that cannot be written as \
-             ASCII; compile the semantic model directly to binary instead",
-            animation.name, node.name
+             ASCII (types: {types}); compile the semantic model directly to binary instead",
+            animation.name, node.name,
         )));
     }
     Ok(())
@@ -1243,13 +1249,23 @@ fn lower_binary_node(
         .light
         .as_ref()
         .and_then(|_| binary_static_scalar(node, LIGHT_RADIUS_CONTROLLER.binary_id(), diagnostics));
-    let alpha = node
-        .mesh
-        .as_ref()
-        .and_then(|_| binary_static_scalar(node, ALPHA_CONTROLLER.binary_id(), diagnostics));
-    let self_illum_color = node.mesh.as_ref().and_then(|_| {
-        binary_static_vec3(node, SELF_ILLUM_COLOR_CONTROLLER.binary_id(), diagnostics)
+    let is_mesh = matches!(
+        node.kind,
+        NodeKind::Trimesh
+            | NodeKind::Skin
+            | NodeKind::Animmesh
+            | NodeKind::Danglymesh
+            | NodeKind::Aabb
+    ) || node.controllers.iter().any(|controller| {
+        controller_definition_by_binary_id(MESH_CONTROLLER_DEFINITIONS, controller.type_id)
+            .is_some()
     });
+    let alpha = is_mesh
+        .then(|| binary_static_scalar(node, ALPHA_CONTROLLER.binary_id(), diagnostics))
+        .flatten();
+    let self_illum_color = is_mesh
+        .then(|| binary_static_vec3(node, SELF_ILLUM_COLOR_CONTROLLER.binary_id(), diagnostics))
+        .flatten();
 
     let parent = binary_parent_name(node, offset_to_name, diagnostics);
     let mesh = lower_binary_mesh(
@@ -1405,13 +1421,23 @@ fn lower_binary_animation_node(
         .light
         .as_ref()
         .and_then(|_| binary_static_scalar(node, LIGHT_RADIUS_CONTROLLER.binary_id(), diagnostics));
-    let alpha = node
-        .mesh
-        .as_ref()
-        .and_then(|_| binary_static_scalar(node, ALPHA_CONTROLLER.binary_id(), diagnostics));
-    let self_illum_color = node.mesh.as_ref().and_then(|_| {
-        binary_static_vec3(node, SELF_ILLUM_COLOR_CONTROLLER.binary_id(), diagnostics)
+    let is_mesh = matches!(
+        node.kind,
+        NodeKind::Trimesh
+            | NodeKind::Skin
+            | NodeKind::Animmesh
+            | NodeKind::Danglymesh
+            | NodeKind::Aabb
+    ) || node.controllers.iter().any(|controller| {
+        controller_definition_by_binary_id(MESH_CONTROLLER_DEFINITIONS, controller.type_id)
+            .is_some()
     });
+    let alpha = is_mesh
+        .then(|| binary_static_scalar(node, ALPHA_CONTROLLER.binary_id(), diagnostics))
+        .flatten();
+    let self_illum_color = is_mesh
+        .then(|| binary_static_vec3(node, SELF_ILLUM_COLOR_CONTROLLER.binary_id(), diagnostics))
+        .flatten();
 
     SemanticAnimationNode {
         kind: node.kind.clone(),
@@ -1460,16 +1486,16 @@ fn lower_binary_animation_node(
             .as_ref()
             .map(|_| binary_scalar_keys(node, LIGHT_RADIUS_CONTROLLER.binary_id(), diagnostics))
             .unwrap_or_default(),
-        alpha_keys: node
-            .mesh
-            .as_ref()
-            .map(|_| binary_scalar_keys(node, ALPHA_CONTROLLER.binary_id(), diagnostics))
-            .unwrap_or_default(),
-        self_illum_color_keys: node
-            .mesh
-            .as_ref()
-            .map(|_| binary_vec3_keys(node, SELF_ILLUM_COLOR_CONTROLLER.binary_id(), diagnostics))
-            .unwrap_or_default(),
+        alpha_keys: if is_mesh {
+            binary_scalar_keys(node, ALPHA_CONTROLLER.binary_id(), diagnostics)
+        } else {
+            Vec::new()
+        },
+        self_illum_color_keys: if is_mesh {
+            binary_vec3_keys(node, SELF_ILLUM_COLOR_CONTROLLER.binary_id(), diagnostics)
+        } else {
+            Vec::new()
+        },
         multiplier_keys: node
             .light
             .as_ref()
@@ -1645,7 +1671,11 @@ fn lower_binary_mesh(
         .map(|skin| lower_binary_skin_weights(skin, part_number_to_name))
         .unwrap_or_default();
     Some(SemanticMesh {
-        vertices: mesh.vertices.clone(),
+        vertices: mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.map(|value| value.is_finite().then_some(value).unwrap_or(0.0)))
+            .collect(),
         faces: mesh.faces.iter().map(lower_binary_face).collect(),
         uv_layers: mesh
             .uv_sets
@@ -1655,7 +1685,11 @@ fn lower_binary_mesh(
                 coordinates: layer.coordinates.clone(),
             })
             .collect(),
-        normals: mesh.normals.clone(),
+        normals: mesh
+            .normals
+            .iter()
+            .map(|normal| normal.map(|value| value.is_finite().then_some(value).unwrap_or(0.0)))
+            .collect(),
         tangents: mesh.tangents.iter().map(|row| row.to_vec()).collect(),
         colors: mesh
             .colors
@@ -1923,15 +1957,15 @@ fn binary_controller_name(node: &BinaryNode, type_id: i32) -> Option<&'static st
     {
         return Some(definition.name());
     }
-    if node.mesh.is_some()
-        && let Some(definition) =
-            controller_definition_by_binary_id(MESH_CONTROLLER_DEFINITIONS, type_id)
+    if node.emitter.is_some() {
+        if let Some(definition) = emitter_controller_definition_by_binary_id(type_id) {
+            return Some(definition.name());
+        }
+    }
+    if let Some(definition) =
+        controller_definition_by_binary_id(MESH_CONTROLLER_DEFINITIONS, type_id)
     {
         return Some(definition.name());
-    }
-    if node.emitter.is_some() {
-        return emitter_controller_definition_by_binary_id(type_id)
-            .map(|definition| definition.name());
     }
     None
 }
