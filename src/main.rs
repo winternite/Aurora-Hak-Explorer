@@ -1574,6 +1574,7 @@ impl HakEditor {
                 self.sync_current_tab();
                 self.tabs.push(TabState::new(archive, false));
                 self.load_tab(self.tabs.len() - 1);
+                self.resource_scroll_reset_pending = true;
                 self.status = format!("Opened {} — {count} resources", path.display());
                 self.remember_recent_archive(&path);
                 if let Some(unsupported) = unsupported {
@@ -2522,6 +2523,7 @@ impl HakEditor {
         self.sync_current_tab();
         self.tabs.push(TabState::new(archive, true));
         self.load_tab(self.tabs.len() - 1);
+        self.resource_scroll_reset_pending = true;
         self.show_new = false;
         self.status = "Created a new unsaved archive".into();
     }
@@ -3736,7 +3738,6 @@ impl eframe::App for HakEditor {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let reset_resource_scroll = std::mem::take(&mut self.resource_scroll_reset_pending);
             ui.horizontal(|ui| {
                 if let Some((name, _, _, _, _)) = &archive_info {
                     ui.strong(name);
@@ -3751,6 +3752,8 @@ impl eframe::App for HakEditor {
             });
             ui.separator();
             if let Some(a) = self.archive.as_ref() {
+                let reset_resource_scroll =
+                    std::mem::take(&mut self.resource_scroll_reset_pending);
                 let visible_indices = resource_view
                     .as_ref()
                     .map(|(_, indices)| Arc::clone(indices))
