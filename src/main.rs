@@ -207,6 +207,7 @@ struct HakEditor {
     recent_archives: Vec<PathBuf>,
     nwn_installation: Option<PathBuf>,
     resource_middle_scroll_anchor: Option<egui::Pos2>,
+    resource_scroll_reset_pending: bool,
     image_preview: Option<ImagePreviewCache>,
     model_preview: Option<ModelPreviewCache>,
     model_view: ModelView,
@@ -663,6 +664,7 @@ impl HakEditor {
             recent_archives,
             nwn_installation,
             resource_middle_scroll_anchor: None,
+            resource_scroll_reset_pending: false,
             image_preview: None,
             model_preview: None,
             model_view: ModelView::Model,
@@ -1416,8 +1418,18 @@ impl HakEditor {
         self.active_tab = Some(index);
         self.typeahead.clear();
         self.typeahead_pending = false;
+        self.resource_middle_scroll_anchor = None;
         self.image_preview = None;
     }
+
+    fn set_category(&mut self, category: Option<String>) {
+        if self.category != category {
+            self.category = category;
+            self.resource_middle_scroll_anchor = None;
+            self.resource_scroll_reset_pending = true;
+        }
+    }
+
     fn switch_tab(&mut self, index: usize) {
         if self.active_tab == Some(index) {
             return;
@@ -3544,12 +3556,12 @@ impl eframe::App for HakEditor {
                     ui.separator();
                     let root_active = self.category.is_none();
                     if resource_tree_row(ui, root_active, &name, count).clicked() {
-                        self.category = None;
+                        self.set_category(None);
                     }
                     ui.indent("categories", |ui| {
                         let active = self.category.as_deref() == Some("New");
                         if resource_tree_row(ui, active, "New", new_count).clicked() {
-                            self.category = Some("New".to_owned());
+                            self.set_category(Some("New".to_owned()));
                             self.selected.clear();
                             self.selection_anchor = None;
                             self.selection_cursor = None;
@@ -3570,7 +3582,7 @@ impl eframe::App for HakEditor {
                                         || (label == "Models All"
                                             && self.category.as_deref() == Some("Models"));
                                     if resource_tree_row(ui, active, label, count).clicked() {
-                                        self.category = Some(label.to_owned());
+                                        self.set_category(Some(label.to_owned()));
                                         self.selected.clear();
                                         self.selection_anchor = None;
                                         self.selection_cursor = None;
@@ -3580,7 +3592,7 @@ impl eframe::App for HakEditor {
                             }
                             let active = self.category.as_deref() == Some(category);
                             if resource_tree_row(ui, active, category, *amount).clicked() {
-                                self.category = Some(category.clone());
+                                self.set_category(Some(category.clone()));
                                 self.selected.clear();
                                 self.selection_anchor = None;
                                 self.selection_cursor = None;
@@ -3724,6 +3736,7 @@ impl eframe::App for HakEditor {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
+            let reset_resource_scroll = std::mem::take(&mut self.resource_scroll_reset_pending);
             ui.horizontal(|ui| {
                 if let Some((name, _, _, _, _)) = &archive_info {
                     ui.strong(name);
@@ -3909,27 +3922,31 @@ impl eframe::App for HakEditor {
                         ui.end_row();
                     });
                 let row_height = ui.spacing().interact_size.y;
-                let resource_scroll_id = ui.make_persistent_id("resource_entries");
-                let requested_scroll_offset = jump_target
-                    .or(keyboard_target)
-                    .and_then(|target| visible_indices.iter().position(|item| *item == target))
-                    .and_then(|row| {
-                        let current_offset =
-                            egui::scroll_area::State::load(&ctx, resource_scroll_id)
-                                .unwrap_or_default()
-                                .offset
-                                .y;
-                        let viewport_height = ui.available_height().max(row_height);
-                        requested_virtualized_scroll_offset(
-                            row,
-                            row_height,
-                            ui.spacing().item_spacing.y,
-                            current_offset,
-                            viewport_height,
-                        )
-                    });
+                let resource_scroll_id = ui.make_persistent_id(("resource_entries", self.active_tab));
+                let requested_scroll_offset = if reset_resource_scroll {
+                    Some(0.0)
+                } else {
+                    jump_target
+                        .or(keyboard_target)
+                        .and_then(|target| visible_indices.iter().position(|item| *item == target))
+                        .and_then(|row| {
+                            let current_offset =
+                                egui::scroll_area::State::load(&ctx, resource_scroll_id)
+                                    .unwrap_or_default()
+                                    .offset
+                                    .y;
+                            let viewport_height = ui.available_height().max(row_height);
+                            requested_virtualized_scroll_offset(
+                                row,
+                                row_height,
+                                ui.spacing().item_spacing.y,
+                                current_offset,
+                                viewport_height,
+                            )
+                        })
+                };
                 let mut resource_scroll_area = egui::ScrollArea::vertical()
-                    .id_salt("resource_entries")
+                    .id_salt(("resource_entries", self.active_tab))
                     .auto_shrink(false);
                 if let Some(offset) = requested_scroll_offset {
                     resource_scroll_area = resource_scroll_area.vertical_scroll_offset(offset);

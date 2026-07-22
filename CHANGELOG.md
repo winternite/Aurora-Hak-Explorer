@@ -2,6 +2,12 @@
 
 All notable changes to Aurora Hak Explorer are recorded here.
 
+## 1.3.2 — 2026-07-22
+
+- Keep each archive tab's resource-list scroll position independent.
+- Return the resource list to the top whenever its Resource Tree category
+  changes.
+
 ## 1.3.1 — 2026-07-22
 
 - Update the bundled Aurora Rust MDL compiler with qualification across
