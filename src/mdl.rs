@@ -1,8 +1,7 @@
 //! Aurora MDL parsing, static geometry preview, and ASCII decompilation.
 //!
-//! The binary layout follows the public NWNTools model structures by Edward
-//! T. Smith and the Open Knights Consortium. This is a bounds-checked Rust
-//! implementation; no legacy code is linked into AHE.
+//! This is a bounds-checked Rust implementation and is independent of the
+//! bundled compiler.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 

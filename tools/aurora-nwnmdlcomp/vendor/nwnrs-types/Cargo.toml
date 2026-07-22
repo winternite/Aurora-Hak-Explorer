@@ -1,0 +1,133 @@
+[package]
+name = "nwnrs-types"
+version = "0.0.1"
+edition = "2024"
+publish = true
+license = "GPL-3.0-only"
+description = "Neverwinter Nights typed formats, resource systems, and tooling helpers"
+repository = "https://github.com/urothis/nwnrs"
+homepage = "https://github.com/urothis/nwnrs"
+documentation = "https://docs.rs/nwnrs-types"
+readme = "README.md"
+
+[features]
+default = [
+    "checksums",
+    "compressedbuf",
+    "dds",
+    "encoding",
+    "erf",
+    "exo",
+    "gff",
+    "install",
+    "io",
+    "key",
+    "localization",
+    "lru",
+    "masterlist",
+    "mdl",
+    "mtr",
+    "nwsync",
+    "plt",
+    "resman",
+    "set",
+    "ssf",
+    "streamext",
+    "tga",
+    "tlk",
+    "twoda",
+    "txi",
+]
+checksums = ["dep:md5", "dep:sha1", "dep:sha2"]
+compressedbuf = ["io", "dep:flate2", "dep:zstd"]
+dds = ["resman", "dep:texpresso"]
+encoding = ["dep:codepage", "dep:encoding_rs"]
+erf = [
+    "checksums",
+    "compressedbuf",
+    "encoding",
+    "exo",
+    "io",
+    "resman",
+    "dep:indexmap",
+]
+exo = []
+gff = [
+    "encoding",
+    "io",
+    "localization",
+    "resman",
+    "dep:base64",
+    "dep:serde_json",
+]
+install = [
+    "checksums",
+    "erf",
+    "key",
+    "nwsync",
+    "resman",
+    "dep:serde",
+    "dep:serde_json",
+]
+io = ["dep:serde"]
+key = ["checksums", "compressedbuf", "exo", "resman", "dep:indexmap"]
+localization = []
+lru = []
+masterlist = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+mdl = ["gff", "mtr", "resman", "twoda", "txi"]
+mtr = ["resman"]
+nwsync = [
+    "checksums",
+    "compressedbuf",
+    "exo",
+    "resman",
+    "dep:indexmap",
+    "dep:rusqlite",
+]
+plt = ["resman"]
+resman = [
+    "checksums",
+    "compressedbuf",
+    "exo",
+    "io",
+    "lru",
+    "dep:indexmap",
+    "dep:serde",
+]
+set = ["resman"]
+ssf = ["io", "localization", "dep:serde"]
+streamext = []
+tga = ["resman"]
+tlk = ["encoding", "io", "localization", "lru", "resman"]
+twoda = ["encoding", "resman"]
+txi = ["resman"]
+
+[dependencies]
+base64 = { version = "0.22", default-features = false, features = ["std"], optional = true }
+codepage = { version = "0.1", default-features = false, optional = true }
+encoding_rs = { version = "0.8", default-features = false, features = ["alloc"], optional = true }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"], optional = true }
+indexmap = { version = "2.14", default-features = false, optional = true }
+md5 = { version = "0.8", default-features = false, optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"], optional = true }
+serde = { version = "1.0", default-features = false, features = ["derive", "std"], optional = true }
+serde_json = { version = "1.0", default-features = false, features = ["preserve_order"], optional = true }
+sha1 = { version = "0.11", default-features = false, optional = true }
+sha2 = { version = "0.11", default-features = false, optional = true }
+texpresso = { version = "2.0", default-features = false, optional = true }
+tracing = { version = "0.1", default-features = false, features = ["attributes", "std"] }
+zstd = { version = "0.13", default-features = false, features = ["arrays", "legacy", "zdict_builder"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.52", default-features = false, features = ["full"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = { version = "0.56", default-features = false }
+
+[package.metadata.docs.rs]
+rustdoc-args = [
+    "-Zunstable-options",
+    "--generate-link-to-definition",
+    "--generate-macro-expansion",
+]

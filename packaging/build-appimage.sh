@@ -15,6 +15,7 @@ appimagetool="${APPIMAGETOOL:-$HOME/Desktop/Aurora-TLK-Explorer/dist/tools/appim
 test -x "$binary"
 "$root/packaging/check-linux-portability.sh" "$binary"
 test -x "$root/tools/linux/nwnmdlcomp"
+"$root/packaging/check-linux-portability.sh" "$root/tools/linux/nwnmdlcomp"
 test -x "$appimagetool"
 mkdir -p "$root/build"
 appdir="$(mktemp -d "$root/build/AppDir-${version}.XXXXXX")"

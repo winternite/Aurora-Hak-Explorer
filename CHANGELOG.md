@@ -2,6 +2,27 @@
 
 All notable changes to Aurora Hak Explorer are recorded here.
 
+## 1.3.0 — 2026-07-22
+
+- Add the memory-safe Rust Aurora nwnmdlcomp compiler and decompiler on Linux
+  and Windows.
+- Use the Rust compiler's parallel multi-file CLI directly while preserving
+  AHE's cancellation, dependency staging, output validation, and compact
+  failure reports.
+- Bundle a portable x86-64 Linux compiler requiring no newer than glibc 2.17
+  and a native Windows x86-64 compiler.
+- Update Aurora nwnmdlcomp to 0.1.1, correcting compiled MDL resource-name
+  field widths and accepting recognizable legacy timestamp preambles and
+  face rows with an omitted optional surface value in compatibility mode.
+- Keep the complete Rust compiler source and its pinned, patched, vendored
+  `nwnrs-types` dependency alongside AHE for reproducible GPL-compliant
+  releases.
+- Compile standalone custom-content models even when their declared
+  supermodel is absent, while continuing to stage and validate supermodels
+  whenever they are available.
+- Update the bundled Rust MDL compiler to accept legacy model headers where a
+  filename was accidentally joined to the non-semantic `#MAXMODEL` marker.
+
 ## 1.2.5 — 2026-07-21
 
 - Replace the import blocklist with a strict NWN/NWN:EE resource-type

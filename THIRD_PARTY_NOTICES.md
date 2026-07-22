@@ -1,37 +1,11 @@
 # Third-party notices
 
-Aurora Hak Explorer's Aurora MDL layout implementation is informed by the
-NWNTools model structures by Edward T. Smith and the Open Knights Consortium.
-The bundled PLT palette tables are sourced from the NWN Explorer distribution
-and are used to reproduce its default Neverwinter Nights material preview. The
-standalone `nwnmdlcomp` model compiler bundled with supported packages is also
-derived from that project and runs without launching Neverwinter Nights.
-
-Copyright (c) 2002-2003, Edward T. Smith. All rights reserved.
-Copyright (c) 2003, The Open Knights Consortium. All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-1. Redistributions of source code must retain the above copyright notice,
-   this list of conditions, the following disclaimer, and acknowledgements.
-2. Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions, the following disclaimer, and acknowledgements in
-   the documentation and/or other materials provided with the distribution.
-3. Neither the name of the Open Knights, Edward T. Smith, the NWNTools project,
-   nor the names of its contributors may be used to endorse or promote products
-   derived from this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
-ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
-ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+The Rust compiler uses `nwnrs-types` from `urothis/nwnrs`, pinned to commit
+`7ca566d8d4b9ac1a087d7298fde0bde97950db48` and carrying an Aurora-specific
+correction for compiled MDL resource-name field widths. Both the compiler and
+that dependency are licensed GPL-3.0-only. Their complete vendored source,
+lockfile, license, and notices are included under
+`tools/aurora-nwnmdlcomp/`.
 
 This software examines data structures used by BioWare's Neverwinter Nights.
 Neverwinter Nights and its data remain subject to their applicable licenses.

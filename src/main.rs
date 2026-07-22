@@ -4772,7 +4772,7 @@ struct ModelDependencyResolver<'a> {
     sibling_archives: Vec<PathBuf>,
     loose_directories: Vec<PathBuf>,
     game_resources: game_resources::GameResourceIndex,
-    cache: BTreeMap<String, Result<ModelDependency, String>>,
+    cache: BTreeMap<String, Result<Option<ModelDependency>, String>>,
 }
 
 impl<'a> ModelDependencyResolver<'a> {
@@ -4859,7 +4859,7 @@ impl<'a> ModelDependencyResolver<'a> {
         }
     }
 
-    fn resolve(&mut self, name: &str) -> Result<ModelDependency, String> {
+    fn resolve(&mut self, name: &str) -> Result<Option<ModelDependency>, String> {
         let key = name.to_ascii_lowercase();
         if let Some(cached) = self.cache.get(&key) {
             return cached.clone();
@@ -4869,10 +4869,10 @@ impl<'a> ModelDependencyResolver<'a> {
         result
     }
 
-    fn resolve_uncached(&self, name: &str) -> Result<ModelDependency, String> {
+    fn resolve_uncached(&self, name: &str) -> Result<Option<ModelDependency>, String> {
         for (archive, origin) in &self.archives {
             if let Some(entry) = find_model_entry(archive, name) {
-                return read_model_dependency(entry, origin.clone());
+                return read_model_dependency(entry, origin.clone()).map(Some);
             }
         }
         for path in &self.sibling_archives {
@@ -4880,7 +4880,7 @@ impl<'a> ModelDependencyResolver<'a> {
                 continue;
             };
             if let Some(entry) = find_model_entry(&archive, name) {
-                return read_model_dependency(entry, path.display().to_string());
+                return read_model_dependency(entry, path.display().to_string()).map(Some);
             }
         }
         let filename = format!("{name}.mdl");
@@ -4899,7 +4899,7 @@ impl<'a> ModelDependencyResolver<'a> {
                 });
             if let Some(path) = path {
                 let bytes = fs::read(&path).map_err(|error| error.to_string())?;
-                return checked_model_dependency(bytes, path.display().to_string());
+                return checked_model_dependency(bytes, path.display().to_string()).map(Some);
             }
         }
         if let Some((bytes, path)) = self
@@ -4907,11 +4907,9 @@ impl<'a> ModelDependencyResolver<'a> {
             .load(name, 0x07d2)
             .map_err(|error| error.to_string())?
         {
-            return checked_model_dependency(bytes, path.display().to_string());
+            return checked_model_dependency(bytes, path.display().to_string()).map(Some);
         }
-        Err(format!(
-            "required supermodel \"{name}\" was not found in the current or open archives, sibling HAKs, NWN development/override folders, or installed game data"
-        ))
+        Ok(None)
     }
 }
 
@@ -5127,7 +5125,12 @@ fn stage_model_dependencies_inner(
     if !visited.insert(key) {
         return Ok(());
     }
-    let dependency = resolver.resolve(&supermodel)?;
+    let Some(dependency) = resolver.resolve(&supermodel)? else {
+        // The compiled MDL stores the supermodel name but does not inline its
+        // payload. Match the Rust compiler and legacy game behavior by
+        // allowing dangling custom-content references to compile.
+        return Ok(());
+    };
     fs::write(
         workspace.join(format!("{supermodel}.mdl")),
         &dependency.bytes,
@@ -5228,7 +5231,6 @@ struct PreparedModel {
     filename: String,
     input: PathBuf,
     destination: PathBuf,
-    source_scene: Option<mdl::Scene>,
 }
 
 fn compile_models_worker(
@@ -5300,7 +5302,10 @@ fn compile_models_worker(
                 workspace.path(),
                 &mut staged_dependencies,
             )?;
-            let input = workspace.path().join(format!("{filename}.ascii"));
+            // The compiler accepts glob patterns as inputs. Stage under an
+            // opaque neutral filename so archive resource names (which can
+            // legitimately contain glob metacharacters) are always literal.
+            let input = workspace.path().join(format!("model-{index}.mdl.ascii"));
             fs::write(&input, &source).map_err(|error| error.to_string())?;
             let destination = request.single_path.clone().unwrap_or_else(|| {
                 request
@@ -5313,7 +5318,6 @@ fn compile_models_worker(
                 filename,
                 input,
                 destination,
-                source_scene: mdl::parse_scene(&source).ok(),
             })
         })();
         match prepared {
@@ -5390,16 +5394,11 @@ fn compile_prepared_batch(
             .first()
             .map_or_else(String::new, |model| model.filename.clone()),
     });
-    let manifest = workspace.join("ahe-batch-manifest.txt");
-    let manifest_contents = batch
+    let inputs = batch
         .iter()
-        .filter_map(|model| model.input.file_name())
-        .map(|name| name.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(&manifest, manifest_contents)
-        .map_err(|error| format!("could not write compiler batch manifest: {error}"))?;
-    let output = run_model_compiler_batch(compiler, workspace, &manifest, cancel)?;
+        .map(|model| model.input.clone())
+        .collect::<Vec<_>>();
+    let output = run_model_compiler_batch(compiler, workspace, &inputs, cancel)?;
     let diagnostics = compiler_diagnostics(&output.stdout, &output.stderr);
     let mut diagnostics_reported = false;
 
@@ -5412,14 +5411,11 @@ fn compile_prepared_batch(
             if !valid_compiled_model(&compiled) {
                 return Err("compiler output was not a valid binary MDL".into());
             }
-            if model
-                .source_scene
-                .as_ref()
-                .is_some_and(|scene| scene.face_count > 0)
-                && mdl::parse_scene(&compiled).map_or(true, |scene| scene.face_count == 0)
-            {
-                return Err("compiler dropped the model's renderable mesh geometry".into());
-            }
+            // The preview parser is intentionally conservative and does not
+            // understand every valid compiled skin/controller layout. The
+            // compiler has already performed a structural binary validation;
+            // do not reject that valid output merely because the optional
+            // preview cannot reconstruct its faces.
             fs::copy(&output_path, &model.destination).map_err(|error| error.to_string())?;
             Ok(())
         })();
@@ -5451,13 +5447,18 @@ fn compile_prepared_batch(
 fn run_model_compiler_batch(
     compiler: &Path,
     workspace: &Path,
-    manifest: &Path,
+    inputs: &[PathBuf],
     cancel: &AtomicBool,
 ) -> Result<std::process::Output, String> {
     let mut command = Command::new(compiler);
     command
-        .arg("--ahe-batch-compile")
-        .arg(manifest)
+        .arg("--quiet")
+        .arg("compile")
+        .arg("--force")
+        .arg("--output-dir")
+        .arg(workspace);
+    command.args(inputs);
+    command
         .current_dir(workspace)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -7741,6 +7742,24 @@ mod clipboard_tests {
     }
 
     #[test]
+    fn allows_compilation_when_a_declared_supermodel_is_missing() {
+        let active = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        let mut resolver = ModelDependencyResolver::new(&active, &[], None);
+        let workspace = tempfile::tempdir().unwrap();
+        let source = b"newmodel custom\nsetsupermodel custom missing_pheno\nbeginmodelgeom custom\nendmodelgeom custom\ndonemodel custom\n";
+        let origins = stage_model_dependencies(
+            &mut resolver,
+            source,
+            workspace.path(),
+            &mut BTreeSet::new(),
+        )
+        .expect("a missing supermodel should not prevent standalone compilation");
+
+        assert!(origins.is_empty());
+        assert!(!workspace.path().join("missing_pheno.mdl").exists());
+    }
+
+    #[test]
     fn bundled_compiler_batches_multiple_models() {
         let workspace = tempfile::tempdir().unwrap();
         let source = |name: &str| {
@@ -7748,15 +7767,19 @@ mod clipboard_tests {
                 "newmodel {name}\nsetsupermodel {name} NULL\nbeginmodelgeom {name}\nnode trimesh mesh\n parent NULL\n verts 3\n 0 0 0\n 1 0 0\n 0 1 0\n faces 1\n 0 1 2 1 0 1 2 0\nendnode\nendmodelgeom {name}\ndonemodel {name}\n"
             )
         };
-        fs::write(workspace.path().join("first.mdl.ascii"), source("first")).unwrap();
-        fs::write(workspace.path().join("second.mdl.ascii"), source("second")).unwrap();
-        let manifest = workspace.path().join("manifest.txt");
-        fs::write(&manifest, "first.mdl.ascii\nsecond.mdl.ascii\n").unwrap();
+        let inputs = ["first", "second"]
+            .into_iter()
+            .map(|name| {
+                let path = workspace.path().join(format!("{name}.mdl.ascii"));
+                fs::write(&path, source(name)).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
         let compiler = bundled_model_compiler().unwrap();
         let output = run_model_compiler_batch(
             &compiler.path,
             workspace.path(),
-            &manifest,
+            &inputs,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -7925,7 +7948,15 @@ mod clipboard_tests {
         for index in 0..130 {
             let name = format!("m{index:03}");
             let path = source_directory.path().join(format!("{name}.mdl"));
-            fs::write(&path, source(&name)).unwrap();
+            let source = if index == 0 {
+                source(&name).replace(
+                    &format!("setsupermodel {name} NULL"),
+                    &format!("setsupermodel {name} missing_custom_supermodel"),
+                )
+            } else {
+                source(&name)
+            };
+            fs::write(&path, source).unwrap();
             archive.add_file(&path).unwrap();
         }
         let compiler = bundled_model_compiler().unwrap();
@@ -7981,9 +8012,12 @@ mod clipboard_tests {
         );
         let output = input.with_extension("");
         let status = Command::new(&compiler.path)
-            .arg("-cqe")
-            .arg(&input)
+            .arg("--quiet")
+            .arg("compile")
+            .arg("--force")
+            .arg("--output")
             .arg(&output)
+            .arg(&input)
             .current_dir(workspace.path())
             .status()
             .unwrap();

@@ -3,8 +3,8 @@ Aurora Hak Explorer @VERSION@ — Windows x86-64 portable build
 No installation is required. Run Aurora-Hak-Explorer.exe.
 
 This build is intended for Windows 10 or Windows 11 on a 64-bit Intel or AMD
-processor. It contains the Microsoft C/C++ runtime statically, so no separate
-Visual C++ Redistributable should be needed.
+processor. Its Microsoft runtime is linked statically, so no separate
+Redistributable should be needed.
 
 Please test with a COPY of an archive first:
 
