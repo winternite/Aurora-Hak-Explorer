@@ -2,6 +2,17 @@
 
 All notable changes to Aurora Hak Explorer are recorded here.
 
+## 1.3.3 — 2026-07-23
+
+- On KDE Plasma Wayland, open AHE on the monitor from which it was launched,
+  matching Aurora TLK Explorer while retaining reliable XWayland file drops.
+- Always compile a fresh locked Windows executable before packaging it,
+  preventing an older build from being silently reused in a new release ZIP.
+- Keep clipboard staging files available for both X11 and Wayland until they
+  are no longer current clipboard contents or needed by an open archive.
+- Show KDE's native copy cursor while dragging one or more resources out of
+  an archive through the X11/XWayland desktop drag bridge.
+
 ## 1.3.2 — 2026-07-22
 
 - Keep each archive tab's resource-list scroll position independent.

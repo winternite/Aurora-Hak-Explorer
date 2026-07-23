@@ -40,9 +40,9 @@ use x11rb::{
         Event,
         xproto::{
             Atom, AtomEnum, ButtonReleaseEvent, ChangeWindowAttributesAux, ClientMessageData,
-            ClientMessageEvent, ConnectionExt, CreateWindowAux, EventMask, GrabMode, GrabStatus,
-            PropMode, Property, PropertyNotifyEvent, SELECTION_NOTIFY_EVENT, SelectionNotifyEvent,
-            SelectionRequestEvent, Window, WindowClass,
+            ClientMessageEvent, ConnectionExt, CreateWindowAux, Cursor, EventMask, GrabMode,
+            GrabStatus, PropMode, Property, PropertyNotifyEvent, SELECTION_NOTIFY_EVENT,
+            SelectionNotifyEvent, SelectionRequestEvent, Window, WindowClass,
         },
     },
     rust_connection::RustConnection,
@@ -270,6 +270,12 @@ fn run(
         .generate_id()
         .map_err(|error| error.to_string())?;
     let atoms = Atoms::new(&connection)?;
+    // winit does not expose an outgoing Linux drag API, so it also cannot
+    // provide the drag-image/copy-badge normally shown by a toolkit.  While
+    // our helper owns the pointer, use the desktop's themed copy cursor.
+    // `dnd-copy` is the standard name used by KDE cursor themes; `copy` is a
+    // useful fallback for themes that use the older name.
+    let drag_cursor = load_drag_cursor(&connection, screen_number);
 
     connection
         .create_window(
@@ -315,7 +321,7 @@ fn run(
                 GrabMode::ASYNC,
                 GrabMode::ASYNC,
                 NONE,
-                NONE,
+                drag_cursor.unwrap_or(NONE),
                 CURRENT_TIME,
             )
             .map_err(|error| error.to_string())?
@@ -424,8 +430,25 @@ fn run(
     let _ = connection.ungrab_pointer(CURRENT_TIME);
     let _ = connection.set_selection_owner(NONE, atoms.xdnd_selection, CURRENT_TIME);
     let _ = connection.destroy_window(source);
+    if let Some(cursor) = drag_cursor {
+        let _ = connection.free_cursor(cursor);
+    }
     let _ = connection.flush();
     Ok(())
+}
+
+fn load_drag_cursor(connection: &RustConnection, screen_number: usize) -> Option<Cursor> {
+    let database = x11rb::resource_manager::new_from_default(connection).ok()?;
+    let handle = x11rb::cursor::Handle::new(connection, screen_number, &database)
+        .ok()?
+        .reply()
+        .ok()?;
+    ["dnd-copy", "copy"].into_iter().find_map(|name| {
+        handle
+            .load_cursor(connection, name)
+            .ok()
+            .filter(|cursor| *cursor != NONE)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -33,6 +33,8 @@ install -Dm644 "$root/assets/aurora-hak-explorer.png" \
   "$appdir/aurora-hak-explorer.png"
 install -Dm644 "$root/assets/aurora-hak-explorer.png" \
   "$appdir/usr/share/icons/hicolor/512x512/apps/aurora-hak-explorer.png"
+install -Dm644 "$root/assets/kwin-active-output.js" \
+  "$appdir/usr/share/aurora-hak-explorer/kwin-active-output.js"
 ln -s aurora-hak-explorer.png "$appdir/.DirIcon"
 install -Dm644 "$root/packaging/aurora-hak-explorer.appdata.xml" \
   "$appdir/usr/share/metainfo/aurora-hak-explorer.appdata.xml"

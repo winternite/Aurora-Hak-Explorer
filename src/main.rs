@@ -50,6 +50,46 @@ const DISPLAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 type TextureDependencies = BTreeMap<String, Vec<archive::Entry>>;
 type TextureDependencyResult = (PathBuf, TextureDependencies);
 
+#[cfg(target_os = "linux")]
+fn enable_kwin_active_output_placement() {
+    const PLUGIN_NAME: &str = "aurora-hak-explorer-active-output";
+
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let Some(prefix) = executable.parent().and_then(|bin| bin.parent()) else {
+        return;
+    };
+    let script = prefix.join("share/aurora-hak-explorer/kwin-active-output.js");
+    if !script.is_file() {
+        return;
+    }
+
+    let _ = Command::new("qdbus")
+        .args([
+            "org.kde.KWin",
+            "/Scripting",
+            "org.kde.kwin.Scripting.unloadScript",
+            PLUGIN_NAME,
+        ])
+        .output();
+    let loaded = Command::new("qdbus")
+        .args([
+            "org.kde.KWin",
+            "/Scripting",
+            "org.kde.kwin.Scripting.loadScript",
+        ])
+        .arg(&script)
+        .arg(PLUGIN_NAME)
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if loaded {
+        let _ = Command::new("qdbus")
+            .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.start"])
+            .output();
+    }
+}
+
 fn main() -> eframe::Result {
     let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     if arguments
@@ -106,6 +146,8 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    #[cfg(target_os = "linux")]
+    enable_kwin_active_output_placement();
     let incoming_paths = match single_instance::route(&arguments) {
         single_instance::Launch::Forwarded => return Ok(()),
         single_instance::Launch::Primary(receiver) => {
@@ -116,12 +158,15 @@ fn main() -> eframe::Result {
     };
     #[allow(unused_mut)]
     let viewport = egui::ViewportBuilder::default()
+        .with_app_id("aurora-hak-explorer")
         .with_inner_size([1050.0, 700.0])
         .with_min_inner_size([760.0, 480.0])
         .with_icon(application_icon());
     #[allow(unused_mut)]
     let mut options = eframe::NativeOptions {
         viewport,
+        centered: false,
+        persist_window: true,
         ..Default::default()
     };
     // KDE's Wayland file-drop negotiation rejects inbound drops on some
@@ -129,7 +174,7 @@ fn main() -> eframe::Result {
     // window to X11, leaving WAYLAND_DISPLAY available so arboard can share
     // the real desktop clipboard with native Wayland file managers.
     #[cfg(target_os = "linux")]
-    if std::env::var_os("DISPLAY").is_some() {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_some() {
         use winit::platform::x11::EventLoopBuilderExtX11;
         options.event_loop_builder = Some(Box::new(|builder| {
             builder.with_x11();
@@ -1461,6 +1506,7 @@ impl HakEditor {
             self.edit_history.clear();
             self.active_tab = None;
             self.status = "Ready — open an archive or create a new one".into();
+            self.prune_clipboard_exports();
             return;
         }
         let next = match self.active_tab {
@@ -1470,6 +1516,7 @@ impl HakEditor {
             None => 0,
         };
         self.load_tab(next);
+        self.prune_clipboard_exports();
     }
     fn continue_quit(&mut self) {
         self.sync_current_tab();
@@ -1629,6 +1676,7 @@ impl HakEditor {
                 // instead of cloning the full archive every UI frame.
                 self.sync_current_tab();
                 self.remember_recent_archive(&path);
+                self.prune_clipboard_exports();
             }
             Err(e) => self.fail("Could not save archive", e),
         }
@@ -2362,6 +2410,40 @@ impl HakEditor {
         }
         Ok(self.clipboard.as_mut().unwrap())
     }
+
+    fn prune_clipboard_exports(&mut self) {
+        let current_clipboard_directory = self
+            .clipboard_exports
+            .last()
+            .map(|directory| directory.path().to_path_buf());
+        let retained = self
+            .clipboard_exports
+            .iter()
+            .filter_map(|directory| {
+                let path = directory.path();
+                let is_current_clipboard = current_clipboard_directory
+                    .as_deref()
+                    .is_some_and(|current| current == path);
+                let referenced_by_archive = self
+                    .archive
+                    .as_ref()
+                    .is_some_and(|archive| archive_references_directory(archive, path));
+                let referenced_by_tab = self.tabs.iter().any(|tab| {
+                    archive_references_directory(&tab.archive, path)
+                        || history_references_directory(&tab.edit_history, path)
+                });
+                let referenced_by_history = history_references_directory(&self.edit_history, path);
+                (is_current_clipboard
+                    || referenced_by_archive
+                    || referenced_by_tab
+                    || referenced_by_history)
+                    .then(|| path.to_path_buf())
+            })
+            .collect::<HashSet<_>>();
+        self.clipboard_exports
+            .retain(|directory| retained.contains(directory.path()));
+    }
+
     fn copy_selected_to_clipboard(&mut self, cut: bool) {
         let Some(archive) = self.archive.as_ref() else {
             return;
@@ -2380,7 +2462,6 @@ impl HakEditor {
                 return;
             }
         };
-        drag_cleanup::register(directory.path(), Duration::ZERO);
         let mut paths = Vec::with_capacity(self.selected.len());
         for index in self.selected.iter().copied() {
             let Some(entry) = archive.entries.get(index) else {
@@ -2412,10 +2493,13 @@ impl HakEditor {
             return;
         }
         // Clipboard file lists refer to these paths, so retain the newest
-        // export while it is on the clipboard. Older exports are no longer
-        // referenced and can be removed immediately.
-        self.clipboard_exports.clear();
+        // export while it is on the clipboard. Older exports remain only when
+        // an open archive or its undo history still references their files.
+        // In particular, do not register this directory with the asynchronous
+        // drag cleaner: X11 clients may read clipboard file paths after the
+        // selection has been published.
         self.clipboard_exports.push(directory);
+        self.prune_clipboard_exports();
         if cut {
             self.delete_selected();
             self.status =
@@ -5811,6 +5895,32 @@ fn estimate_entry_bytes(entry: &Entry) -> usize {
         .saturating_add(data)
 }
 
+fn entry_references_directory(entry: &Entry, directory: &Path) -> bool {
+    matches!(&entry.data, EntryData::ExternalFile(path) if path.starts_with(directory))
+}
+
+fn archive_references_directory(archive: &Archive, directory: &Path) -> bool {
+    archive
+        .entries
+        .iter()
+        .any(|entry| entry_references_directory(entry, directory))
+}
+
+fn history_references_directory(history: &EditHistory, directory: &Path) -> bool {
+    history
+        .undo
+        .iter()
+        .chain(&history.redo)
+        .filter_map(|transaction| match &transaction.edit {
+            ArchiveEdit::Resources(changes) => Some(changes),
+            ArchiveEdit::Description { .. } => None,
+        })
+        .flat_map(|changes| changes.iter())
+        .flat_map(|change| [change.before.as_ref(), change.after.as_ref()])
+        .flatten()
+        .any(|entry| entry_references_directory(entry, directory))
+}
+
 fn summarize_import_failures(failures: &[String]) -> String {
     const SHOWN_FAILURES: usize = 25;
     let mut message = failures
@@ -7265,6 +7375,37 @@ mod clipboard_tests {
         }
 
         fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn clipboard_staging_references_are_retained_for_archives_and_history() {
+        let directory = tempfile::Builder::new()
+            .prefix("ahe-clipboard-")
+            .tempdir()
+            .unwrap();
+        let file = directory.path().join("resource.mdl");
+        fs::write(&file, b"resource").unwrap();
+        let mut archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        let entry = archive.prepare_incoming_file(file).unwrap();
+        archive.entries.push(entry.clone());
+        assert!(archive_references_directory(&archive, directory.path()));
+
+        let transaction = resource_transaction(
+            "clipboard import".to_owned(),
+            vec![ResourceChange {
+                key: ("resource".to_owned(), entry.type_id),
+                before: None,
+                after: Some(entry),
+            }],
+            BTreeSet::new(),
+            BTreeSet::new(),
+            None,
+            None,
+            false,
+        );
+        let mut history = EditHistory::default();
+        assert!(history.record(transaction));
+        assert!(history_references_directory(&history, directory.path()));
     }
 
     #[test]
